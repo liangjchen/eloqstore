@@ -81,9 +81,6 @@ public:
 
     /** These methods are provided for worker thread. */
     virtual KvError Init(Shard *shard) = 0;
-    virtual void Start()
-    {
-    }
     virtual bool IsIdle();
     virtual void Stop()
     {
@@ -979,7 +976,7 @@ private:
 
     private:
         CloudStoreMgr *io_mgr_;
-        bool killed_{false};
+        bool killed_{true};
     };
 
     FileCleaner file_cleaner_;

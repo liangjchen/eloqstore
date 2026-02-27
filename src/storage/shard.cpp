@@ -82,7 +82,6 @@ void Shard::InitIoMgrAndPagePool()
 void Shard::WorkLoop()
 {
     shard = this;
-    io_mgr_->Start();
     InitIoMgrAndPagePool();
 
     // Get new requests from the queue, only blocked when there are no requests
@@ -170,7 +169,7 @@ void Shard::Start()
 {
 #ifdef ELOQ_MODULE_ENABLED
     shard = this;
-    io_mgr_->Start();
+    running_status_ = 0;
 #else
     thd_ = std::thread([this] { WorkLoop(); });
 #endif
@@ -205,12 +204,6 @@ void Shard::Stop()
 {
 #ifndef ELOQ_MODULE_ENABLED
     thd_.join();
-#else
-    // In module mode the IO manager lives in the calling thread, so we must
-    // stop it explicitly to drain in-flight cloud tasks before tearing down
-    // task pools. This is safe since eloqstore module is unregistered hence
-    // no WorkOneRound is called.
-    io_mgr_->Stop();
 #endif
     task_mgr_.Shutdown();
 }
@@ -326,6 +319,13 @@ bool Shard::HasPendingLocalGc(const TableIdent &tbl_id)
     return !pending_q.local_gc_req_.done_.load(std::memory_order_relaxed);
 #endif
 }
+
+#ifdef ELOQ_MODULE_ENABLED
+bool Shard::NeedStop() const
+{
+    return running_status_.load(std::memory_order_relaxed) == 1;
+}
+#endif
 
 IndexPageManager *Shard::IndexManager()
 {
@@ -686,6 +686,16 @@ void Shard::OnTaskFinished(KvTask *task)
 #ifdef ELOQ_MODULE_ENABLED
 void Shard::WorkOneRound()
 {
+    if (int8_t running_status = running_status_.load(std::memory_order_relaxed);
+        __builtin_expect(running_status != 0, 0))
+    {
+        if (running_status == 1)
+        {
+            io_mgr_->Stop();
+            running_status_.store(2, std::memory_order_release);
+        }
+        return;
+    }
     ts_ = ReadTimeMicroseconds();
 #ifdef ELOQSTORE_WITH_TXSERVICE
     // Metrics collection: start timing the round
