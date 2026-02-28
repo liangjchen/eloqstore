@@ -2910,6 +2910,22 @@ KvError CloudStoreMgr::RestoreFilesForTable(const TableIdent &tbl_id,
         return ToKvError(-ec.value());
     }
 
+    struct CachedFileInfo
+    {
+        std::string filename;
+        fs::path path;
+        bool is_data_file;
+        size_t expected_size;
+        FileId file_id;
+    };
+
+    std::vector<CachedFileInfo> cached_files;
+    cached_files.reserve(64);
+
+    bool has_max_data_file = false;
+    FileId max_file_id = 0;
+    size_t max_data_file_idx = 0;
+
     fs::directory_iterator end;
     for (; file_it != end; file_it.increment(ec))
     {
@@ -2959,11 +2975,50 @@ KvError CloudStoreMgr::RestoreFilesForTable(const TableIdent &tbl_id,
             return KvError::InvalidArgs;
         }
 
-        size_t expected_size = EstimateFileSize(filename);
-        EnqueClosedFile(FileKey{tbl_id, std::move(filename)});
-        used_local_space_ += expected_size;
-        ++restored_files;
-        restored_bytes += expected_size;
+        if (is_manifest_file)
+        {
+            std::error_code remove_ec;
+            fs::remove(file_it->path(), remove_ec);
+            if (remove_ec)
+            {
+                LOG(ERROR) << "Failed to remove manifest file "
+                           << file_it->path() << ": " << remove_ec.message();
+                return KvError::InvalidArgs;
+            }
+            else
+            {
+                LOG(INFO) << "Removed manifest file " << file_it->path()
+                          << " during cache restore";
+            }
+            continue;
+        }
+
+        CachedFileInfo info{filename,
+                            file_it->path(),
+                            is_data_file,
+                            EstimateFileSize(filename),
+                            0};
+
+        if (is_data_file)
+        {
+            FileId file_id = 0;
+            uint64_t term = 0;
+            if (!ParseDataFileSuffix(suffix, file_id, term))
+            {
+                LOG(ERROR) << "Invalid data file name " << info.path
+                           << " encountered during cache restore";
+                return KvError::InvalidArgs;
+            }
+            info.file_id = file_id;
+            if (!has_max_data_file || file_id > max_file_id)
+            {
+                has_max_data_file = true;
+                max_file_id = file_id;
+                max_data_file_idx = cached_files.size();
+            }
+        }
+
+        cached_files.emplace_back(std::move(info));
     }
 
     if (ec)
@@ -2971,6 +3026,38 @@ KvError CloudStoreMgr::RestoreFilesForTable(const TableIdent &tbl_id,
         LOG(ERROR) << "Failed to iterate partition directory " << table_path
                    << " for table " << tbl_id << ": " << ec.message();
         return ToKvError(-ec.value());
+    }
+
+    if (has_max_data_file)
+    {
+        const CachedFileInfo &victim = cached_files[max_data_file_idx];
+        std::error_code remove_ec;
+        fs::remove(victim.path, remove_ec);
+        if (remove_ec)
+        {
+            LOG(ERROR) << "Failed to remove max data file " << victim.path
+                       << ": " << remove_ec.message();
+            return KvError::InvalidArgs;
+        }
+        else
+        {
+            LOG(INFO) << "Removed max data file " << victim.path
+                      << " during cache restore";
+        }
+    }
+
+    for (size_t i = 0; i < cached_files.size(); ++i)
+    {
+        if (has_max_data_file && i == max_data_file_idx)
+        {
+            continue;
+        }
+
+        CachedFileInfo &file_info = cached_files[i];
+        EnqueClosedFile(FileKey{tbl_id, std::move(file_info.filename)});
+        used_local_space_ += file_info.expected_size;
+        ++restored_files;
+        restored_bytes += file_info.expected_size;
     }
 
     return KvError::NoError;
@@ -3675,7 +3762,8 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::RefreshManifest(
     }
 
     std::string tmp_name = ManifestFileName(selected_term) + ".tmp";
-    KvError write_err = WriteFile(tbl_id, tmp_name, buffer);
+    uint64_t flags = O_WRONLY | O_CREAT | O_DIRECT | O_NOATIME | O_TRUNC;
+    KvError write_err = WriteFile(tbl_id, tmp_name, buffer, flags);
     RecycleBuffer(std::move(buffer));
     if (write_err != KvError::NoError)
     {
@@ -4308,7 +4396,8 @@ int CloudStoreMgr::ReserveCacheSpace(size_t size)
 
 KvError CloudStoreMgr::DownloadFile(const TableIdent &tbl_id,
                                     FileId file_id,
-                                    uint64_t term)
+                                    uint64_t term,
+                                    bool download_to_exist)
 {
     KvTask *current_task = ThdTask();
     std::string filename = ToFilename(file_id, term);
@@ -4329,13 +4418,31 @@ KvError CloudStoreMgr::DownloadFile(const TableIdent &tbl_id,
         return download_task.error_;
     }
 
+    auto [dir_fd, dir_err] =
+        OpenOrCreateFD(tbl_id, LruFD::kDirectory, false, true, 0);
+    if (dir_err != KvError::NoError)
+    {
+        ReleaseCloudBuffer(std::move(download_task.response_data_));
+        return dir_err;
+    }
     std::string tmp_filename = filename + ".tmp";
-    KvError err = WriteFile(tbl_id, tmp_filename, download_task.response_data_);
+
+    if (download_to_exist)
+    {
+        int res =
+            Rename(dir_fd.FdPair(), filename.c_str(), tmp_filename.c_str());
+        if (res != 0 && res != -ENOENT)
+        {
+            ReleaseCloudBuffer(std::move(download_task.response_data_));
+            return ToKvError(res);
+        }
+    }
+
+    uint64_t flags = O_WRONLY | O_CREAT | O_DIRECT | O_NOATIME;
+    KvError err =
+        WriteFile(tbl_id, tmp_filename, download_task.response_data_, flags);
     ReleaseCloudBuffer(std::move(download_task.response_data_));
     CHECK_KV_ERR(err);
-
-    auto [dir_fd, dir_err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
-    CHECK_KV_ERR(dir_err);
 
     int res = Rename(dir_fd.FdPair(), tmp_filename.c_str(), filename.c_str());
     if (res < 0)
@@ -4984,28 +5091,25 @@ KvError MemStoreMgr::Manifest::SkipPadding(size_t n)
 
 KvError CloudStoreMgr::WriteFile(const TableIdent &tbl_id,
                                  std::string_view filename,
-                                 const DirectIoBuffer &buffer)
+                                 const DirectIoBuffer &buffer,
+                                 uint64_t flags)
 {
-    fs::path path =
-        tbl_id.StorePath(options_->store_path, options_->store_path_lut);
-    path /= filename;
-    std::error_code ec;
-    fs::create_directories(path.parent_path(), ec);
+    auto [dir_fd, dir_err] =
+        OpenOrCreateFD(tbl_id, LruFD::kDirectory, false, true, 0);
+    if (dir_err != KvError::NoError)
+    {
+        return dir_err;
+    }
 
-    std::string path_str = path.string();
-    io_uring_sqe *sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    open_how how = {
-        .flags = O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT | O_NOATIME,
-        .mode = 0644,
-        .resolve = 0};
-    io_uring_prep_openat2(sqe, AT_FDCWD, path_str.c_str(), &how);
-    int fd = ThdTask()->WaitIoResult();
+    std::string filename_str(filename);
+    int fd = OpenAt(dir_fd.FdPair(), filename_str.c_str(), flags, 0644, false);
     if (fd < 0)
     {
-        LOG(ERROR) << "failed to open file for write: " << path_str
-                   << ", error=" << strerror(-fd);
+        LOG(ERROR) << "failed to open file for write: " << tbl_id << '/'
+                   << filename_str << ": " << strerror(-fd);
         return ToKvError(fd);
     }
+    FdIdx file_fd{fd, false};
 
     KvError status = KvError::NoError;
     const size_t padded_size = buffer.padded_size();
@@ -5021,7 +5125,7 @@ KvError CloudStoreMgr::WriteFile(const TableIdent &tbl_id,
     while (off < padded_size)
     {
         size_t to_write = padded_size - off;
-        int wres = Write({fd, false}, write_ptr + off, to_write, off);
+        int wres = Write(file_fd, write_ptr + off, to_write, off);
         if (wres < 0)
         {
             status = ToKvError(wres);
@@ -5035,19 +5139,8 @@ KvError CloudStoreMgr::WriteFile(const TableIdent &tbl_id,
         off += static_cast<size_t>(wres);
     }
 
-    sqe = GetSQE(UserDataType::KvTask, ThdTask());
-    io_uring_prep_close(sqe, fd);
-    int close_res = ThdTask()->WaitIoResult();
-    if (close_res < 0)
-    {
-        LOG(ERROR) << "close file/directory " << fd
-                   << " failed: " << strerror(-close_res);
-        if (status == KvError::NoError)
-        {
-            status = ToKvError(close_res);
-        }
-    }
-    if (status == KvError::NoError && close_res < 0)
+    int close_res = Close(fd);
+    if (close_res < 0 && status == KvError::NoError)
     {
         status = ToKvError(close_res);
     }
