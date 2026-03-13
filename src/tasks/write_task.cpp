@@ -87,6 +87,59 @@ const TableIdent &WriteTask::TableId() const
     return tbl_ident_;
 }
 
+void WriteTask::AddInflightUploadTask()
+{
+    inflight_upload_tasks_++;
+}
+
+DirectIoBuffer WriteTask::AcquireUploadStateBuffer()
+{
+    CHECK(IoMgr()->HasCloudBufferPool());
+    return IoMgr()->AcquireCloudBuffer(this);
+}
+
+void WriteTask::ReleaseUploadStateBuffer(DirectIoBuffer buffer)
+{
+    if (buffer.capacity() == 0)
+    {
+        return;
+    }
+    CHECK(IoMgr()->HasCloudBufferPool());
+    IoMgr()->ReleaseCloudBuffer(std::move(buffer));
+}
+
+void WriteTask::EnsureUploadStateBuffer()
+{
+    if (upload_state_.buffer.capacity() != 0)
+    {
+        return;
+    }
+    upload_state_.buffer = AcquireUploadStateBuffer();
+}
+
+void WriteTask::CompletePendingUploadTask(ObjectStore::UploadTask *task)
+{
+    assert(task != nullptr);
+    assert(task->owner_write_task_ == this);
+    // Once the HTTP upload has completed, the task only needs error/status
+    // fields until commit. Return the payload buffer to the cloud pool now to
+    // keep memory bounded by active cloud concurrency instead of sealed-file
+    // count.
+    ReleaseUploadStateBuffer(std::move(task->data_buffer_));
+    assert(inflight_upload_tasks_ > 0);
+    inflight_upload_tasks_--;
+    if (inflight_upload_tasks_ == 0)
+    {
+        upload_waiting_.Wake();
+    }
+}
+
+void WriteTask::ResetUploadState()
+{
+    ReleaseUploadStateBuffer(std::move(upload_state_.buffer));
+    upload_state_.ResetMetadata();
+}
+
 void WriteTask::Reset(const TableIdent &tbl_id)
 {
     tbl_ident_ = tbl_id;
@@ -102,21 +155,20 @@ void WriteTask::Reset(const TableIdent &tbl_id)
     }
     append_aggregator_ = WriteBufferAggregator(buf_size);
     append_aggregator_.Reset();
-    upload_state_.ResetMetadata();
-    if (!Options()->cloud_store_path.empty())
-    {
-        upload_state_.buffer.EnsureDefaultReserve();
-    }
+    CHECK_EQ(inflight_upload_tasks_, 0)
+        << "WriteTask::Reset() called with async uploads still in flight";
+    CHECK(pending_upload_tasks_.empty())
+        << "WriteTask::Reset() called before pending uploads were drained";
+    inflight_upload_tasks_ = 0;
+    pending_upload_tasks_.clear();
+    ResetUploadState();
 }
 
 void WriteTask::Abort()
 {
     LOG(INFO) << "WriteTask to " << tbl_ident_ << " is aborted";
-    if (Options()->data_append_mode)
-    {
-        // Drain pending async writes before task is freed.
-        (void) WaitWrite();
-    }
+    (void) WaitWrite();
+    (void) WaitPendingUploads();
     // Always invoke AbortWrite so CloudStoreMgr can clear per-table upload
     // segments and io manager can reset dirty state.
     IoMgr()->AbortWrite(tbl_ident_);
@@ -128,7 +180,8 @@ void WriteTask::Abort()
     }
     cow_meta_ = CowRootMeta();
     last_append_file_id_.reset();
-    upload_state_.ResetMetadata();
+    pending_upload_tasks_.clear();
+    ResetUploadState();
 }
 
 KvError WriteTask::WritePage(DataPage &&page)
@@ -216,15 +269,15 @@ KvError WriteTask::AppendWritePage(VarPage page, FilePageId file_page_id)
             file_switched ? last_append_file_id_.value() : file_id;
         // Flush any pending writes in the aggregator
         FlushAppendWrites();
+        if (write_err_ != KvError::NoError)
+        {
+            return write_err_;
+        }
         // In cloud append mode, trigger immediate upload of sealed file
-        // This ensures sealed data files are uploaded promptly
+        // without waiting for cloud completion.
         if (file_switched)
         {
-            // Wait for flush to complete before uploading
-            KvError err = WaitWrite();
-            CHECK_KV_ERR(err);
-            // Trigger upload of the sealed file (may use in-memory segments)
-            err = IoMgr()->OnDataFileSealed(tbl_ident_, sealed_file_id);
+            KvError err = IoMgr()->OnDataFileSealed(tbl_ident_, sealed_file_id);
             CHECK_KV_ERR(err);
         }
         uint16_t buf_index = 0;
@@ -300,6 +353,30 @@ void WriteTask::FlushAppendWrites()
         }
         write_err_ = err;
     }
+}
+
+KvError WriteTask::ConsumePendingUploadResults()
+{
+    KvError upload_err = KvError::NoError;
+    for (const auto &upload_task : pending_upload_tasks_)
+    {
+        if (upload_task != nullptr && upload_task->error_ != KvError::NoError &&
+            upload_err == KvError::NoError)
+        {
+            upload_err = upload_task->error_;
+        }
+    }
+    pending_upload_tasks_.clear();
+    return upload_err;
+}
+
+KvError WriteTask::WaitPendingUploads()
+{
+    while (inflight_upload_tasks_ > 0)
+    {
+        upload_waiting_.Wait(this);
+    }
+    return ConsumePendingUploadResults();
 }
 
 void WriteTask::WritePageCallback(VarPage page, KvError err)
@@ -510,6 +587,9 @@ KvError WriteTask::UpdateMeta()
     CHECK_KV_ERR(err);
 
     err = IoMgr()->SyncData(tbl_ident_);
+    CHECK_KV_ERR(err);
+
+    err = WaitPendingUploads();
     CHECK_KV_ERR(err);
 
     // Update meta data in storage and then in memory.

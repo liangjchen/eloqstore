@@ -94,6 +94,10 @@ public:
     virtual void InitBackgroundJob()
     {
     }
+    virtual KvError RestoreStartupState()
+    {
+        return KvError::NoError;
+    }
     virtual void RunPrewarm() {};
 
     /** These methods are provided for kv task. */
@@ -126,6 +130,20 @@ public:
                              DirectIoBuffer &content)
     {
         __builtin_unreachable();
+    }
+
+    virtual bool HasCloudBufferPool() const
+    {
+        return false;
+    }
+    virtual DirectIoBuffer AcquireCloudBuffer(KvTask *task)
+    {
+        (void) task;
+        return {};
+    }
+    virtual void ReleaseCloudBuffer(DirectIoBuffer buffer)
+    {
+        (void) buffer;
     }
 
     // Append-mode write buffer pool helpers (default no-op).
@@ -216,9 +234,10 @@ public:
      * complete and should be uploaded immediately. This enables immediate
      * upload of sealed data files in cloud append mode.
      *
-     * The call is synchronous within the current write task context. Returning
-     * an error will fail the write request and trigger AbortWrite to clean up
-     * any partial state.
+     * The callback itself runs in the current write task context, but cloud
+     * implementations may submit the sealed-file upload asynchronously and
+     * return before the upload completes. Returning an error still fails the
+     * write request and triggers AbortWrite to clean up any partial state.
      *
      * @param tbl_id Table identifier
      * @param file_id The file_id that was just sealed (before switching to
@@ -610,7 +629,8 @@ public:
                          FileId file_id,
                          uint64_t flags,
                          uint64_t mode,
-                         uint64_t term = 0);
+                         uint64_t term = 0,
+                         bool skip_cloud_lookup = false);
     virtual KvError SyncFile(LruFD::Ref fd);
     virtual KvError SyncFiles(const TableIdent &tbl_id,
                               std::span<LruFD::Ref> fds);
@@ -637,13 +657,17 @@ public:
      * @brief Open file or create it if not exists. This method can be used to
      * open data-file/manifest or create data-file, but not create manifest.
      * Only data file is opened with O_DIRECT by default. Set `direct` to true
-     * to open manifest with O_DIRECT.
+     * to open manifest with O_DIRECT. When `skip_cloud_lookup` is true, cloud
+     * implementations may return ENOENT directly on local miss and let the
+     * caller decide whether to create the file.
      */
-    std::pair<LruFD::Ref, KvError> OpenOrCreateFD(const TableIdent &tbl_id,
-                                                  FileId file_id,
-                                                  bool direct = false,
-                                                  bool create = true,
-                                                  uint64_t term = 0);
+    std::pair<LruFD::Ref, KvError> OpenOrCreateFD(
+        const TableIdent &tbl_id,
+        FileId file_id,
+        bool direct = false,
+        bool create = true,
+        uint64_t term = 0,
+        bool skip_cloud_lookup = false);
     bool EvictFD();
 
     class WriteReqPool
@@ -738,6 +762,7 @@ public:
         return LruFD::kManifest;
     }
     KvError Init(Shard *shard) override;
+    KvError RestoreStartupState() override;
     bool IsIdle() override;
     void Stop() override;
     void Submit() override;
@@ -802,7 +827,7 @@ public:
     void StopAllPrewarmTasks();
     void AcquireCloudSlot(KvTask *task);
     void ReleaseCloudSlot(size_t count = 1);
-    void EnqueueCloudReadyTask(KvTask *task);
+    void EnqueueCloudReadyTask(ObjectStore::Task *task);
     void ProcessCloudReadyTasks(Shard *shard);
     bool AppendPrewarmFiles(std::vector<PrewarmFile> &files);
     size_t GetPrewarmPendingCount() const;
@@ -812,6 +837,12 @@ public:
     void RecycleBuffers(std::vector<DirectIoBuffer> &buffers);
     void RecycleBuffer(DirectIoBuffer buffer);
     DirectIoBufferPool &GetDirectIoBufferPool();
+    bool HasCloudBufferPool() const override
+    {
+        return true;
+    }
+    DirectIoBuffer AcquireCloudBuffer(KvTask *task) override;
+    void ReleaseCloudBuffer(DirectIoBuffer buffer) override;
     PrewarmStats &GetPrewarmStats()
     {
         return prewarm_stats_;
@@ -877,7 +908,8 @@ private:
                  FileId file_id,
                  uint64_t flags,
                  uint64_t mode,
-                 uint64_t term = 0) override;
+                 uint64_t term = 0,
+                 bool skip_cloud_lookup = false) override;
     KvError SyncFile(LruFD::Ref fd) override;
     KvError SyncFiles(const TableIdent &tbl_id,
                       std::span<LruFD::Ref> fds) override;
@@ -886,7 +918,8 @@ private:
     KvError UploadFile(const TableIdent &tbl_id,
                        std::string filename,
                        WriteTask *owner,
-                       std::string_view payload = {});
+                       std::string_view payload = {},
+                       bool wait_for_completion = true);
     KvError UploadFiles(const TableIdent &tbl_id,
                         std::vector<std::string> filenames);
     /**
@@ -909,8 +942,6 @@ private:
                            size_t prefix_len,
                            DirectIoBuffer &buffer,
                            size_t dst_offset);
-    DirectIoBuffer AcquireCloudBuffer(KvTask *task);
-    void ReleaseCloudBuffer(DirectIoBuffer buffer);
 
     bool DequeClosedFile(const FileKey &key);
     void EnqueClosedFile(FileKey key);
@@ -986,7 +1017,7 @@ private:
     size_t active_prewarm_tasks_{0};
 
     // Prewarm queue management
-    moodycamel::ConcurrentQueue<KvTask *> cloud_ready_tasks_;
+    moodycamel::ConcurrentQueue<ObjectStore::Task *> cloud_ready_tasks_;
     moodycamel::ConcurrentQueue<PrewarmFile> prewarm_queue_;
     static constexpr size_t kMaxPrewarmPendingFiles = 1000;
     std::atomic<bool> prewarm_listing_complete_{false};
