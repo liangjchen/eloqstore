@@ -105,6 +105,47 @@ TEST_CASE("EloqStore ValidateOptions validates all parameters", "[eloq_store]")
     REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == true);
     REQUIRE(options.prewarm_cloud_cache == false);
 
+    // standby path conflicting with cloud configuration should be fixed.
+    options = CreateValidOptions(test_dir);
+    options.cloud_store_path = "cloud";
+    options.enable_local_standby = true;
+    options.standby_master_addr = "local";
+    options.standby_master_store_paths = {"/primary"};
+    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == true);
+    REQUIRE(options.enable_local_standby == false);
+    REQUIRE(options.standby_master_addr.empty());
+    REQUIRE(options.standby_master_store_paths.empty());
+
+    // standby addr must be local or username@addr
+    options = CreateValidOptions(test_dir);
+    options.enable_local_standby = true;
+    options.standby_master_addr = "invalid";
+    options.standby_master_store_paths = {"/primary"};
+    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
+
+    // valid standby configuration is accepted
+    options = CreateValidOptions(test_dir);
+    options.enable_local_standby = true;
+    options.standby_master_addr = "standby@standby-host";
+    options.standby_master_store_paths = {"/primary"};
+    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == true);
+
+    // standby weights must match standby path count when provided
+    options = CreateValidOptions(test_dir);
+    options.enable_local_standby = true;
+    options.standby_master_addr = "standby@standby-host";
+    options.standby_master_store_paths = {"/primary"};
+    options.standby_master_store_path_weights = {1, 2};
+    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
+
+    // standby weights must be non-zero
+    options = CreateValidOptions(test_dir);
+    options.enable_local_standby = true;
+    options.standby_master_addr = "standby@standby-host";
+    options.standby_master_store_paths = {"/primary"};
+    options.standby_master_store_path_weights = {0};
+    REQUIRE(eloqstore::EloqStore::ValidateOptions(options) == false);
+
     CleanupTestDir(test_dir);
 }
 

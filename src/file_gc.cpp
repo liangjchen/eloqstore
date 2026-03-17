@@ -41,7 +41,6 @@ void GetRetainedFiles(absl::flat_hash_set<FileId> &result,
         {
             MemIndexPage *idx_page = reinterpret_cast<MemIndexPage *>(val);
             FilePageId fp_id = idx_page->GetFilePageId();
-
             result.emplace(fp_id >> pages_per_file_shift);
         }
         if ((page_id & 0xFF) == 0)
@@ -54,8 +53,23 @@ void GetRetainedFiles(absl::flat_hash_set<FileId> &result,
 namespace FileGarbageCollector
 {
 
+namespace
+{
+bool IsFileRetained(const RetainedFiles &retained_files,
+                    FileId file_id,
+                    uint64_t term)
+{
+    auto it = retained_files.find(file_id);
+    if (it == retained_files.end())
+    {
+        return false;
+    }
+    return it->second == term;
+}
+}  // namespace
+
 KvError ExecuteLocalGC(const TableIdent &tbl_id,
-                       const absl::flat_hash_set<FileId> &retained_files,
+                       const RetainedFiles &retained_files,
                        IouringMgr *io_mgr)
 {
     DLOG(INFO) << "ExecuteLocalGC: starting for table " << tbl_id.tbl_name_
@@ -74,14 +88,11 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
 
     // 2. classify files.
     std::vector<std::string> archive_files;
-    std::vector<uint64_t> archive_timestamps;
+    std::vector<std::string> archive_tags;
     std::vector<std::string> data_files;
     std::vector<uint64_t> manifest_terms;
-    ClassifyFiles(local_files,
-                  archive_files,
-                  archive_timestamps,
-                  data_files,
-                  manifest_terms);
+    ClassifyFiles(
+        local_files, archive_files, archive_tags, data_files, manifest_terms);
 
     // No need to check term expired for local mode.
 
@@ -89,7 +100,7 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
     FileId least_not_archived_file_id = 0;
     err = GetOrUpdateArchivedMaxFileId(tbl_id,
                                        archive_files,
-                                       archive_timestamps,
+                                       archive_tags,
                                        least_not_archived_file_id,
                                        io_mgr);
 
@@ -193,12 +204,12 @@ KvError ListCloudFiles(const TableIdent &tbl_id,
 
 void ClassifyFiles(const std::vector<std::string> &files,
                    std::vector<std::string> &archive_files,
-                   std::vector<uint64_t> &archive_timestamps,
+                   std::vector<std::string> &archive_tags,
                    std::vector<std::string> &data_files,
                    std::vector<uint64_t> &manifest_terms)
 {
     archive_files.clear();
-    archive_timestamps.clear();
+    archive_tags.clear();
     data_files.clear();
     manifest_terms.clear();
     data_files.reserve(files.size());
@@ -218,20 +229,20 @@ void ClassifyFiles(const std::vector<std::string> &files,
         if (ret.first == FileNameManifest)
         {
             // Only support term-aware archive format:
-            // manifest_<term>_<ts> Legacy format manifest_<ts> is no longer
+            // manifest_<term>_<tag> Legacy format manifest_<ts> is no longer
             // supported.
             uint64_t term = 0;
-            std::optional<uint64_t> timestamp;
-            if (!ParseManifestFileSuffix(ret.second, term, timestamp))
+            std::optional<std::string> tag;
+            if (!ParseManifestFileSuffix(ret.second, term, tag))
             {
                 continue;
             }
-            // Only recognize term-aware archives (both term and timestamp must
+            // Only recognize term-aware archives (both term and tag must
             // be present).
-            if (timestamp.has_value())
+            if (tag.has_value())
             {
                 archive_files.push_back(file_name);
-                archive_timestamps.push_back(timestamp.value());
+                archive_tags.push_back(std::move(*tag));
             }
             else
             {
@@ -356,7 +367,7 @@ FileId ParseArchiveForMaxFileId(const std::string &archive_filename,
 KvError GetOrUpdateArchivedMaxFileId(
     const TableIdent &tbl_id,
     const std::vector<std::string> &archive_files,
-    const std::vector<uint64_t> &archive_timestamps,
+    const std::vector<std::string> &archive_tags,
     FileId &least_not_archived_file_id,
     IouringMgr *io_mgr)
 {
@@ -369,18 +380,41 @@ KvError GetOrUpdateArchivedMaxFileId(
         return KvError::NoError;
     }
 
-    // 2. find the latest archive file (timestamp <= mapping_ts).
-    // mapping_ts is the current timestamp, ensure only completed archive files
-    // are processed.
+    // 2. find the latest archive file by tag.
+    // Prefer numeric comparison when tag parses as uint64_t; fallback to
+    // lexicographic compare for non-numeric tags.
     std::string latest_archive;
-    uint64_t latest_ts = 0;
+    bool latest_is_numeric = false;
+    uint64_t latest_numeric = 0;
+    std::string latest_tag;
     for (size_t i = 0; i < archive_files.size(); ++i)
     {
-        uint64_t ts = archive_timestamps[i];
-        if (ts > latest_ts)
+        const std::string &tag = archive_tags[i];
+        uint64_t numeric = 0;
+        const bool is_numeric = ParseUint64(tag, numeric);
+        bool should_replace = false;
+        if (latest_archive.empty())
         {
-            latest_ts = ts;
+            should_replace = true;
+        }
+        else if (is_numeric && latest_is_numeric)
+        {
+            should_replace = numeric > latest_numeric;
+        }
+        else if (is_numeric != latest_is_numeric)
+        {
+            should_replace = is_numeric;
+        }
+        else
+        {
+            should_replace = tag > latest_tag;
+        }
+        if (should_replace)
+        {
             latest_archive = archive_files[i];
+            latest_tag = tag;
+            latest_is_numeric = is_numeric;
+            latest_numeric = numeric;
         }
     }
 
@@ -437,7 +471,7 @@ KvError DeleteUnreferencedCloudFiles(
     const TableIdent &tbl_id,
     const std::vector<std::string> &data_files,
     const std::vector<uint64_t> &manifest_terms,
-    const absl::flat_hash_set<FileId> &retained_files,
+    const RetainedFiles &retained_files,
     FileId least_not_archived_file_id,
     CloudStoreMgr *cloud_mgr)
 {
@@ -472,7 +506,7 @@ KvError DeleteUnreferencedCloudFiles(
         // max file ID)
         // 2. Not in retained_files (files not needed in the current version)
         if (file_id >= least_not_archived_file_id &&
-            !retained_files.contains(file_id))
+            !IsFileRetained(retained_files, file_id, term))
         {
             std::string remote_path = tbl_id.ToString() + "/" + file_name;
             files_to_delete.push_back(remote_path);
@@ -537,12 +571,11 @@ KvError DeleteUnreferencedCloudFiles(
     return KvError::NoError;
 }
 
-KvError DeleteUnreferencedLocalFiles(
-    const TableIdent &tbl_id,
-    const std::vector<std::string> &data_files,
-    const absl::flat_hash_set<FileId> &retained_files,
-    FileId least_not_archived_file_id,
-    IouringMgr *io_mgr)
+KvError DeleteUnreferencedLocalFiles(const TableIdent &tbl_id,
+                                     const std::vector<std::string> &data_files,
+                                     const RetainedFiles &retained_files,
+                                     FileId least_not_archived_file_id,
+                                     IouringMgr *io_mgr)
 {
     namespace fs = std::filesystem;
     fs::path dir_path = tbl_id.StorePath(io_mgr->options_->store_path,
@@ -575,7 +608,7 @@ KvError DeleteUnreferencedLocalFiles(
         // the archived max file ID)
         // 2. Not in retained_files (files not needed in the current version)
         if (file_id >= least_not_archived_file_id &&
-            !retained_files.contains(file_id))
+            !IsFileRetained(retained_files, file_id, term))
         {
             fs::path file_path = dir_path / file_name;
             files_to_delete.push_back(file_path.string());
@@ -589,7 +622,9 @@ KvError DeleteUnreferencedLocalFiles(
                        << " since file_id=" << file_id
                        << ", least_not_archived_file_id="
                        << least_not_archived_file_id << ", in_retained="
-                       << (retained_files.contains(file_id) ? "true" : "false");
+                       << (IsFileRetained(retained_files, file_id, term)
+                               ? "true"
+                               : "false");
         }
     }
 
@@ -625,7 +660,7 @@ KvError DeleteUnreferencedLocalFiles(
 }
 
 KvError ExecuteCloudGC(const TableIdent &tbl_id,
-                       const absl::flat_hash_set<FileId> &retained_files,
+                       const RetainedFiles &retained_files,
                        CloudStoreMgr *cloud_mgr)
 {
     // Check term file before proceeding
@@ -669,14 +704,11 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
 
     // 2. classify files.
     std::vector<std::string> archive_files;
-    std::vector<uint64_t> archive_timestamps;
+    std::vector<std::string> archive_tags;
     std::vector<std::string> data_files;
     std::vector<uint64_t> manifest_terms;
-    ClassifyFiles(cloud_files,
-                  archive_files,
-                  archive_timestamps,
-                  data_files,
-                  manifest_terms);
+    ClassifyFiles(
+        cloud_files, archive_files, archive_tags, data_files, manifest_terms);
 
     // 3. check if term expired to avoid deleting invisible files.
     for (auto term : manifest_terms)
@@ -691,7 +723,7 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
     FileId least_not_archived_file_id = 0;
     err = GetOrUpdateArchivedMaxFileId(tbl_id,
                                        archive_files,
-                                       archive_timestamps,
+                                       archive_tags,
                                        least_not_archived_file_id,
                                        static_cast<IouringMgr *>(cloud_mgr));
     if (err != KvError::NoError)

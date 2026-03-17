@@ -4,6 +4,7 @@
 #include <cassert>
 #include <limits>
 
+#include "eloq_store.h"
 #include "kv_options.h"
 #include "tasks/list_object_task.h"
 #include "tasks/read_task.h"
@@ -21,6 +22,7 @@ uint32_t background_write_pool_size_default = 1024;
 uint32_t read_pool_size_default = 2048;
 uint32_t scan_pool_size_default = 2048;
 uint32_t list_object_pool_size_default = 512;
+uint32_t list_standby_partition_pool_size_default = 128;
 uint32_t reopen_pool_size_default = 256;
 }  // namespace
 
@@ -36,6 +38,7 @@ TaskManager::TaskManager(const KvOptions *opts)
       read_pool_(read_pool_size_default),
       scan_pool_(scan_pool_size_default),
       list_object_pool_(list_object_pool_size_default),
+      list_standby_partition_pool_(list_standby_partition_pool_size_default),
       reopen_pool_(reopen_pool_size_default)
 {
     if (opts != nullptr && opts->max_write_concurrency > 0)
@@ -50,11 +53,47 @@ TaskManager::TaskManager(const KvOptions *opts)
 
 void TaskManager::Shutdown()
 {
+    size_t aborted_tasks = 0;
+    size_t aborted_reqs = 0;
+    auto abort_unfinished = [&](KvTask *task)
+    {
+        if (task->status_ == TaskStatus::Idle ||
+            task->status_ == TaskStatus::Finished)
+        {
+            return;
+        }
+        ++aborted_tasks;
+        if (task->req_ != nullptr)
+        {
+            ++aborted_reqs;
+            LOG(INFO) << "TaskManager::Shutdown abort request "
+                      << typeid(*task->req_).name();
+            task->req_->SetDone(KvError::NotRunning);
+            task->req_ = nullptr;
+        }
+        task->status_ = TaskStatus::Finished;
+        task->inflight_io_ = 0;
+    };
+    batch_write_pool_.ForEachTask(abort_unfinished);
+    bg_write_pool_.ForEachTask(abort_unfinished);
+    read_pool_.ForEachTask(abort_unfinished);
+    scan_pool_.ForEachTask(abort_unfinished);
+    list_object_pool_.ForEachTask(abort_unfinished);
+    list_standby_partition_pool_.ForEachTask(abort_unfinished);
+    reopen_pool_.ForEachTask(abort_unfinished);
+    LOG(INFO) << "TaskManager::Shutdown finished, aborted_tasks="
+              << aborted_tasks << ", aborted_reqs=" << aborted_reqs;
+
+    num_active_ = 0;
+    num_active_write_ = 0;
+
     batch_write_pool_.Clear();
     bg_write_pool_.Clear();
     read_pool_.Clear();
     scan_pool_.Clear();
     list_object_pool_.Clear();
+    list_standby_partition_pool_.Clear();
+    reopen_pool_.Clear();
 }
 
 void TaskManager::SetPoolSizesForTest(uint32_t batch_write_pool_size,
@@ -124,6 +163,12 @@ ListObjectTask *TaskManager::GetListObjectTask()
     return list_object_pool_.GetTask();
 }
 
+ListStandbyPartitionTask *TaskManager::GetListStandbyPartitionTask()
+{
+    num_active_++;
+    return list_standby_partition_pool_.GetTask();
+}
+
 ReopenTask *TaskManager::GetReopenTask(const TableIdent &tbl_id)
 {
     num_active_++;
@@ -157,6 +202,10 @@ void TaskManager::FreeTask(KvTask *task)
         break;
     case TaskType::ListObject:
         list_object_pool_.FreeTask(static_cast<ListObjectTask *>(task));
+        break;
+    case TaskType::ListStandbyPartition:
+        list_standby_partition_pool_.FreeTask(
+            static_cast<ListStandbyPartitionTask *>(task));
         break;
     case TaskType::Reopen:
         reopen_pool_.FreeTask(static_cast<ReopenTask *>(task));

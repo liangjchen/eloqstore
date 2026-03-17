@@ -290,7 +290,7 @@ KvError BackgroundWrite::CompactDataFile()
     return KvError::NoError;
 }
 
-KvError BackgroundWrite::CreateArchive(uint64_t provided_ts)
+KvError BackgroundWrite::CreateArchive(std::string_view tag)
 {
     assert(Options()->data_append_mode);
     assert(Options()->num_retained_archives > 0);
@@ -300,6 +300,8 @@ KvError BackgroundWrite::CreateArchive(uint64_t provided_ts)
     {
         // Partitions without manifest files (e.g., only term files) are
         // normal, archive is considered complete.
+        DLOG(INFO) << "CreateArchive is skipped, table=" << tbl_ident_
+                   << ", term=" << IoMgr()->ProcessTerm() << ", tag=" << tag;
         return KvError::NoError;
     }
     CHECK_KV_ERR(compact_err);
@@ -308,10 +310,6 @@ KvError BackgroundWrite::CreateArchive(uint64_t provided_ts)
     CHECK_KV_ERR(err);
     RootMeta *meta = root_handle.Get();
     PageId root = meta->root_id_;
-    if (root == MaxPageId)
-    {
-        return KvError::NotFound;
-    }
 
     PageId ttl_root = meta->ttl_root_id_;
     MappingSnapshot *mapping = meta->mapper_->GetMapping();
@@ -331,19 +329,31 @@ KvError BackgroundWrite::CreateArchive(uint64_t provided_ts)
     std::string_view snapshot = wal_builder_.Snapshot(
         root, ttl_root, mapping, max_fp_id, dict_bytes, term_buf);
 
-    uint64_t current_ts =
-        provided_ts != 0 ? provided_ts : utils::UnixTs<chrono::microseconds>();
-    err = IoMgr()->CreateArchive(tbl_ident_, snapshot, current_ts);
+    const std::string generated_tag =
+        tag.empty() ? std::to_string(utils::UnixTs<chrono::microseconds>())
+                    : std::string();
+    if (tag.empty())
+    {
+        tag = generated_tag;
+    }
+
+    DLOG(INFO) << "CreateArchive begin, table=" << tbl_ident_
+               << ", term=" << IoMgr()->ProcessTerm() << ", tag=" << tag
+               << ", root=" << root << ", ttl_root=" << ttl_root
+               << ", max_fp_id=" << max_fp_id
+               << ", snapshot_bytes=" << snapshot.size();
+    err = IoMgr()->CreateArchive(tbl_ident_, snapshot, tag);
     CHECK_KV_ERR(err);
+    DLOG(INFO) << "CreateArchive done, table=" << tbl_ident_
+               << ", term=" << IoMgr()->ProcessTerm() << ", tag=" << tag;
 
     // Update the cached max file id.
     FileId max_file_id =
         static_cast<FileId>(max_fp_id >> Options()->pages_per_file_shift);
     IoMgr()->least_not_archived_file_ids_[tbl_ident_] = max_file_id + 1;
 
-    LOG(INFO) << "created archive for partition " << tbl_ident_ << " at "
-              << current_ts << ", updated cached max file id to "
-              << max_file_id + 1;
+    LOG(INFO) << "created archive for partition " << tbl_ident_ << " with tag "
+              << tag << ", updated cached max file id to " << max_file_id + 1;
     return KvError::NoError;
 }
 

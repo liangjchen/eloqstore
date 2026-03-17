@@ -368,19 +368,19 @@ void PrewarmService::PrewarmCloudCache(const std::string &remote_path)
     {
         auto *cloud_mgr =
             static_cast<CloudStoreMgr *>(store_->shards_[i]->IoManager());
-        if (!cloud_mgr->prewarmers_.empty())
+        if (!cloud_mgr->HasPrewarmWorkers())
         {
-            // Reset state for new prewarm session
-            cloud_mgr->prewarm_files_pulled_.store(0,
-                                                   std::memory_order_relaxed);
-            cloud_mgr->prewarm_listing_complete_.store(
-                false, std::memory_order_relaxed);
-            cloud_mgr->prewarm_queue_size_.store(0, std::memory_order_relaxed);
-
-            // Initialize stats
-            cloud_mgr->GetPrewarmStats() = PrewarmStats{};
-            cloud_mgr->GetPrewarmStats().start_time = prewarm_start;
+            continue;
         }
+        // Reset state for new prewarm session
+        cloud_mgr->prewarm_files_pulled_.store(0, std::memory_order_relaxed);
+        cloud_mgr->prewarm_listing_complete_.store(false,
+                                                   std::memory_order_relaxed);
+        cloud_mgr->prewarm_queue_size_.store(0, std::memory_order_relaxed);
+
+        // Initialize stats
+        cloud_mgr->GetPrewarmStats() = PrewarmStats{};
+        cloud_mgr->GetPrewarmStats().start_time = prewarm_start;
     }
 
     std::string continuation_token;
@@ -436,7 +436,7 @@ void PrewarmService::PrewarmCloudCache(const std::string &remote_path)
             for (auto &shard : store_->shards_)
             {
                 auto *cloud_mgr =
-                    static_cast<CloudStoreMgr *>(shard->IoManager());
+                    reinterpret_cast<CloudStoreMgr *>(shard->IoManager());
                 cloud_mgr->GetPrewarmStats().completion_reason =
                     completion_reason;
                 cloud_mgr->MarkPrewarmListingComplete();
@@ -505,14 +505,14 @@ void PrewarmService::PrewarmCloudCache(const std::string &remote_path)
             if (file_type == FileNameManifest)
             {
                 uint64_t term = 0;
-                std::optional<uint64_t> ts;
-                if (!ParseManifestFileSuffix(suffix, term, ts) ||
-                    ts.has_value())
+                std::optional<std::string> tag;
+                if (!ParseManifestFileSuffix(suffix, term, tag) ||
+                    tag.has_value())
                 {
                     total_files_skipped++;
                     continue;
                 }
-                file.file_id = CloudStoreMgr::ManifestFileId();
+                file.file_id = IouringMgr::LruFD::kManifest;
                 file.term = term;
                 file.is_manifest = true;
             }
@@ -567,7 +567,7 @@ void PrewarmService::PrewarmCloudCache(const std::string &remote_path)
 
             auto *cloud_mgr =
                 static_cast<CloudStoreMgr *>(store_->shards_[i]->IoManager());
-            if (cloud_mgr->prewarmers_.empty())
+            if (cloud_mgr == nullptr || !cloud_mgr->HasPrewarmWorkers())
             {
                 continue;
             }
@@ -598,7 +598,7 @@ void PrewarmService::PrewarmCloudCache(const std::string &remote_path)
                 for (auto &shard : store_->shards_)
                 {
                     auto *mgr =
-                        static_cast<CloudStoreMgr *>(shard->IoManager());
+                        reinterpret_cast<CloudStoreMgr *>(shard->IoManager());
                     mgr->GetPrewarmStats().completion_reason =
                         completion_reason;
                     mgr->MarkPrewarmListingComplete();
@@ -622,7 +622,7 @@ listing_done:
     size_t total_pulled = 0;
     for (auto &shard : store_->shards_)
     {
-        auto *cloud_mgr = static_cast<CloudStoreMgr *>(shard->IoManager());
+        auto *cloud_mgr = reinterpret_cast<CloudStoreMgr *>(shard->IoManager());
         auto &stats = cloud_mgr->GetPrewarmStats();
         stats.end_time = prewarm_end;
         stats.total_files_pulled = cloud_mgr->GetPrewarmFilesPulled();
@@ -719,11 +719,8 @@ void PrewarmService::AbortPrewarmWorkers()
         {
             continue;
         }
-        auto *cloud_mgr = static_cast<CloudStoreMgr *>(shard_ptr->IoManager());
-        if (cloud_mgr == nullptr)
-        {
-            continue;
-        }
+        auto *cloud_mgr =
+            reinterpret_cast<CloudStoreMgr *>(shard_ptr->IoManager());
         cloud_mgr->GetPrewarmStats().completion_reason =
             PrewarmStats::CompletionReason::Shutdown;
         cloud_mgr->MarkPrewarmListingComplete();

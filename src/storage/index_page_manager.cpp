@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "async_io_manager.h"
+#include "eloq_store.h"
 #include "error.h"
 #include "kv_options.h"
 #include "replayer.h"
@@ -53,6 +54,7 @@ size_t RootMetaBytes(const RootMeta &meta)
     bytes += meta.compression_->DictionaryMemoryBytes();
     return bytes;
 }
+
 }  // namespace
 
 IndexPageManager::IndexPageManager(AsyncIoManager *io_manager)
@@ -339,13 +341,20 @@ void IndexPageManager::UpdateRoot(const TableIdent &tbl_ident,
 }
 
 KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
-                                                  CowRootMeta &cow_meta)
+                                                  CowRootMeta &cow_meta,
+                                                  std::string_view reopen_tag)
 {
-    if (Options()->cloud_store_path.empty())
+    CHECK(eloq_store != nullptr);
+    const StoreMode mode = eloq_store->Mode();
+    DLOG(INFO) << "InstallExternalSnapshot begin, table " << tbl_ident
+               << ", mode " << static_cast<int>(mode) << ", tag " << reopen_tag;
+    if (mode != StoreMode::Cloud && mode != StoreMode::StandbyReplica)
     {
+        LOG(ERROR) << "InstallExternalSnapshot invalid mode, table "
+                   << tbl_ident << ", mode " << static_cast<int>(mode)
+                   << ", tag " << reopen_tag;
         return KvError::InvalidArgs;
     }
-    auto *cloud_mgr = static_cast<CloudStoreMgr *>(IoMgr());
 
     auto [root_handle, root_err] = FindRoot(tbl_ident);
     if (root_err == KvError::NoError)
@@ -356,8 +365,10 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
             FilePageId max_fp_id =
                 old_meta->mapper_->FilePgAllocator()->MaxFilePageId();
             FileId max_file_id = max_fp_id >> Options()->pages_per_file_shift;
-            if (max_file_id <= IouringMgr::LruFD::kMaxDataFile)
+            if (mode == StoreMode::Cloud &&
+                max_file_id <= IouringMgr::LruFD::kMaxDataFile)
             {
+                auto *cloud_mgr = static_cast<CloudStoreMgr *>(IoMgr());
                 uint64_t term = IoMgr()
                                     ->GetFileIdTerm(tbl_ident, max_file_id)
                                     .value_or(IoMgr()->ProcessTerm());
@@ -372,12 +383,40 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
         }
     }
 
-    auto [manifest, err] = cloud_mgr->RefreshManifest(tbl_ident);
-    CHECK_KV_ERR(err);
+    ManifestFilePtr manifest;
+    KvError err = KvError::NoError;
+    if (mode == StoreMode::Cloud)
+    {
+        auto *cloud_mgr = static_cast<CloudStoreMgr *>(IoMgr());
+        auto [m, cloud_err] = cloud_mgr->RefreshManifest(tbl_ident, reopen_tag);
+        err = cloud_err;
+        manifest = std::move(m);
+    }
+    else if (mode == StoreMode::StandbyReplica)
+    {
+        auto *standby_mgr = static_cast<StandbyStoreMgr *>(IoMgr());
+        auto [m, standby_err] = standby_mgr->RefreshManifest(tbl_ident);
+        err = standby_err;
+        manifest = std::move(m);
+    }
+    if (err != KvError::NoError)
+    {
+        LOG(ERROR) << "InstallExternalSnapshot RefreshManifest failed, table "
+                   << tbl_ident << ", mode " << static_cast<int>(mode)
+                   << ", tag " << reopen_tag << ", error "
+                   << static_cast<uint32_t>(err);
+        return err;
+    }
 
     Replayer replayer(Options());
     err = replayer.Replay(manifest.get());
-    CHECK_KV_ERR(err);
+    if (err != KvError::NoError)
+    {
+        LOG(ERROR) << "InstallExternalSnapshot Replay failed, table "
+                   << tbl_ident << ", tag " << reopen_tag << ", error "
+                   << static_cast<uint32_t>(err);
+        return err;
+    }
 
     auto [entry, inserted] = root_meta_mgr_.GetOrCreate(tbl_ident);
     RootMeta &meta = entry->meta_;
@@ -421,6 +460,9 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
     IoMgr()->SetFileIdTermMapping(entry->tbl_id_,
                                   replayer.file_id_term_mapping_);
 
+    DLOG(INFO) << "InstallExternalSnapshot finish, table " << tbl_ident
+               << ", tag " << reopen_tag << ", root_id " << replayer.root_
+               << ", ttl_root_id " << replayer.ttl_root_;
     return KvError::NoError;
 }
 

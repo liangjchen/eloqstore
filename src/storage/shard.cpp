@@ -16,7 +16,9 @@
 
 #include "async_io_manager.h"
 #include "error.h"
+#include "standby_service.h"
 #include "tasks/list_object_task.h"
+#include "tasks/list_standby_partition_task.h"
 #include "tasks/reopen_task.h"
 #include "utils.h"
 
@@ -49,11 +51,7 @@ Shard::Shard(const EloqStore *store, size_t shard_id, uint32_t fd_limit)
       task_mgr_(&store->options_),
       stack_allocator_(store->options_.coroutine_stack_size),
       io_mgr_(AsyncIoManager::Instance(store, fd_limit)),
-      index_mgr_(io_mgr_.get())
-{
-    const auto &opts = store_->options_;
-    oss_enabled_ = !opts.store_path.empty() && !opts.cloud_store_path.empty();
-}
+      index_mgr_(io_mgr_.get()) {};
 
 KvError Shard::Init()
 {
@@ -62,10 +60,14 @@ KvError Shard::Init()
     if (io_mgr_ != nullptr)
     {
         uint64_t term = store_ != nullptr ? store_->Term() : 0;
-        if (auto *cloud_mgr = dynamic_cast<CloudStoreMgr *>(io_mgr_.get());
-            cloud_mgr != nullptr)
+        if (store_->Mode() == StoreMode::Cloud)
         {
-            cloud_mgr->SetProcessTerm(term);
+            static_cast<CloudStoreMgr *>(io_mgr_.get())->SetProcessTerm(term);
+        }
+        else if (store_->Mode() == StoreMode::StandbyReplica ||
+                 store_->Mode() == StoreMode::StandbyMaster)
+        {
+            static_cast<StandbyStoreMgr *>(io_mgr_.get())->SetProcessTerm(term);
         }
     }
     InitializeTscFrequency();
@@ -75,26 +77,20 @@ KvError Shard::Init()
 
 void Shard::InitIoMgrAndPagePool()
 {
-    io_mgr_->InitBackgroundJob();
-    io_mgr_and_page_pool_inited_ = true;
-}
-
-void Shard::RunStartupRestore()
-{
     KvError err = io_mgr_->RestoreStartupState();
-    startup_restore_finished_ = true;
     if (err != KvError::NoError)
     {
         LOG(FATAL) << "startup cache restore failed on shard " +
                           std::to_string(shard_id_) + ": " + ErrorString(err);
         exit(1);
     }
+    io_mgr_->InitBackgroundJob();
+    io_mgr_and_page_pool_inited_.store(true, std::memory_order_release);
 }
 
 void Shard::WorkLoop()
 {
     shard = this;
-    RunStartupRestore();
     InitIoMgrAndPagePool();
 
     // Get new requests from the queue, only blocked when there are no requests
@@ -107,7 +103,10 @@ void Shard::WorkLoop()
         // Idle state, wait for new requests or exit.
         while (nreqs == 0 && task_mgr_.NumActive() == 0 && io_mgr_->IsIdle())
         {
-            if (store_->IsStopped())
+            const auto status =
+                store_->running_status_.load(std::memory_order_relaxed);
+            if (status !=
+                static_cast<uint8_t>(EloqStore::RunningStatus::Running))
             {
                 return -1;
             }
@@ -510,9 +509,43 @@ bool Shard::ProcessReq(KvRequest *req)
         StartTask(task, req, lbd);
         return true;
     }
+    case RequestType::ListStandbyPartition:
+    {
+        ListStandbyPartitionTask *task =
+            task_mgr_.GetListStandbyPartitionTask();
+        DLOG(INFO) << "Shard::ProcessReq ListStandbyPartition start, shard_id="
+                   << shard_id_ << ", req=" << req << ", task=" << task;
+        auto lbd = [req]() -> KvError
+        {
+            StandbyService *standby = shard->store_->GetStandbyService();
+            if (standby == nullptr)
+            {
+                return KvError::InvalidArgs;
+            }
+            auto *list_req = static_cast<ListStandbyPartitionRequest *>(req);
+            KvTask *current_task = ThdTask();
+            CHECK(current_task != nullptr);
+            DLOG(INFO) << "Shard::ProcessReq ListStandbyPartition enqueue, req="
+                       << req << ", task=" << current_task;
+            KvError enqueue_err =
+                standby->ListRemotePartitions(list_req->GetPartitions());
+            if (enqueue_err != KvError::NoError)
+            {
+                return enqueue_err;
+            }
+            current_task->WaitIo();
+            DLOG(INFO) << "Shard::ProcessReq ListStandbyPartition done, req="
+                       << req << ", task=" << current_task
+                       << ", io_res=" << current_task->io_res_;
+            return static_cast<KvError>(current_task->io_res_);
+        };
+        StartTask(task, req, lbd);
+        return true;
+    }
     case RequestType::Reopen:
     {
         ReopenTask *task = task_mgr_.GetReopenTask(req->TableId());
+        task->SetRequest(static_cast<ReopenRequest *>(req));
         auto lbd = [task, req]() -> KvError
         { return task->Reopen(req->TableId()); };
         StartTask(task, req, lbd);
@@ -570,9 +603,17 @@ bool Shard::ProcessReq(KvRequest *req)
         {
             return false;
         }
-        uint64_t snapshot_ts = archive_req->GetSnapshotTimestamp();
-        auto lbd = [task, snapshot_ts]() -> KvError
-        { return task->CreateArchive(snapshot_ts); };
+        const std::string tag = archive_req->Tag();
+        const uint64_t term = archive_req->Term();
+        const ArchiveRequest::Action action = archive_req->GetAction();
+        auto lbd = [task, term, tag, action]() -> KvError
+        {
+            if (action == ArchiveRequest::Action::Create)
+            {
+                return task->CreateArchive(tag);
+            }
+            return task->DeleteArchive(term, tag);
+        };
         StartTask(task, req, lbd);
         return true;
     }
@@ -585,6 +626,13 @@ bool Shard::ProcessReq(KvRequest *req)
     case RequestType::GlobalReopen:
     {
         LOG(ERROR) << "GlobalReopen request routed to shard unexpectedly";
+        req->SetDone(KvError::InvalidArgs);
+        return true;
+    }
+    case RequestType::GlobalListArchiveTags:
+    {
+        LOG(ERROR)
+            << "GlobalListArchiveTags request routed to shard unexpectedly";
         req->SetDone(KvError::InvalidArgs);
         return true;
     }
@@ -627,10 +675,15 @@ bool Shard::ProcessReq(KvRequest *req)
 
 bool Shard::ExecuteReadyTasks()
 {
-    if (oss_enabled_)
+    if (store_->Mode() == StoreMode::Cloud)
     {
-        auto *cloud_mgr = reinterpret_cast<CloudStoreMgr *>(io_mgr_.get());
+        auto *cloud_mgr = static_cast<CloudStoreMgr *>(io_mgr_.get());
         cloud_mgr->ProcessCloudReadyTasks(this);
+    }
+    if (StandbyService *standby = store_->GetStandbyService();
+        standby != nullptr)
+    {
+        standby->ProcessReadyTasks(shard_id_);
     }
     bool busy = ready_tasks_.Size() > 0;
     while (ready_tasks_.Size() > 0)
@@ -719,11 +772,9 @@ void Shard::WorkOneRound()
     metrics::TimePoint round_start{};
 #endif
 
-    if (__builtin_expect(!startup_restore_finished_, false))
-    {
-        RunStartupRestore();
-    }
-    if (__builtin_expect(!io_mgr_and_page_pool_inited_, false))
+    if (__builtin_expect(
+            !io_mgr_and_page_pool_inited_.load(std::memory_order_acquire),
+            false))
     {
         InitIoMgrAndPagePool();
     }

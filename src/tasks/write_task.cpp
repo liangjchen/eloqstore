@@ -27,7 +27,7 @@ namespace eloqstore
 namespace
 {
 KvError BuildRetainedFiles(const TableIdent &tbl_id,
-                           absl::flat_hash_set<FileId> &retained_files,
+                           RetainedFiles &retained_files,
                            std::vector<MappingSnapshot::Ref> &snapshot_array)
 {
     auto [root_handle, err] = shard->IndexManager()->FindRoot(tbl_id);
@@ -47,12 +47,32 @@ KvError BuildRetainedFiles(const TableIdent &tbl_id,
         }
         snapshot_array.emplace_back(MappingSnapshot::Ref(mapping));
     }
-    retained_files.clear();
-    retained_files.reserve(approx_file_cnt);
+
+    absl::flat_hash_set<FileId> file_ids;
+    file_ids.reserve(approx_file_cnt);
     for (const MappingSnapshot::Ref &mapping : snapshot_array)
     {
-        GetRetainedFiles(retained_files, mapping->mapping_tbl_, shift);
+        GetRetainedFiles(file_ids, mapping->mapping_tbl_, shift);
         ThdTask()->YieldToLowPQ();
+    }
+
+    retained_files.clear();
+    retained_files.reserve(file_ids.size());
+    auto *io_mgr = static_cast<IouringMgr *>(shard->IoManager());
+    for (FileId file_id : file_ids)
+    {
+        uint64_t term = 0;
+        if (std::optional<uint64_t> file_term =
+                io_mgr->GetFileIdTerm(tbl_id, file_id))
+        {
+            term = *file_term;
+        }
+        else
+        {
+            LOG(WARNING) << "BuildRetainedFiles: missing term for file_id "
+                         << file_id << " in table " << tbl_id;
+        }
+        retained_files.emplace(file_id, term);
     }
     return KvError::NoError;
 }
@@ -75,6 +95,8 @@ std::string_view WriteTask::TaskTypeName() const
         return "Scan";
     case TaskType::ListObject:
         return "ListObject";
+    case TaskType::ListStandbyPartition:
+        return "ListStandbyPartition";
     case TaskType::Reopen:
         return "Reopen";
     default:
@@ -244,9 +266,9 @@ std::pair<FileId, uint32_t> WriteTask::ConvFilePageId(
     FilePageId file_page_id) const
 {
     FileId file_id = file_page_id >> Options()->pages_per_file_shift;
-    uint32_t offset =
-        (file_page_id & (uint32_t{1} << Options()->pages_per_file_shift) - 1) *
-        Options()->data_page_size;
+    uint32_t offset = (file_page_id &
+                       ((uint32_t{1} << Options()->pages_per_file_shift) - 1)) *
+                      Options()->data_page_size;
     return {file_id, offset};
 }
 
@@ -580,6 +602,11 @@ KvError WriteTask::FlushManifest()
     return KvError::NoError;
 }
 
+KvError WriteTask::DeleteArchive(uint64_t term, std::string_view tag)
+{
+    return IoMgr()->DeleteArchive(tbl_ident_, term, tag);
+}
+
 KvError WriteTask::UpdateMeta()
 {
     // Flush data pages.
@@ -660,7 +687,7 @@ void WriteTask::TriggerFileGC() const
 {
     assert(Options()->data_append_mode);
 
-    absl::flat_hash_set<FileId> retained_files;
+    RetainedFiles retained_files;
     std::vector<MappingSnapshot::Ref> snapshot_array;
     KvError build_err =
         BuildRetainedFiles(tbl_ident_, retained_files, snapshot_array);
@@ -710,7 +737,7 @@ void WriteTask::TriggerFileGC() const
 KvError WriteTask::TriggerLocalFileGC() const
 {
     assert(Options()->data_append_mode);
-    absl::flat_hash_set<FileId> retained_files;
+    RetainedFiles retained_files;
     std::vector<MappingSnapshot::Ref> snapshot_array;
     KvError build_err =
         BuildRetainedFiles(tbl_ident_, retained_files, snapshot_array);

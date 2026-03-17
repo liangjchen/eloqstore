@@ -820,6 +820,41 @@ TEST_CASE("cloud gc preserves archived data after truncate",
     store->Stop();
 }
 
+TEST_CASE("cloud archive create is idempotent for an existing tag",
+          "[cloud][archive]")
+{
+    CleanupStore(cloud_archive_opts);
+
+    eloqstore::EloqStore *store = InitStore(cloud_archive_opts);
+    MapVerifier tester(test_tbl_id, store, false);
+    tester.SetValueSize(1000);
+    tester.Upsert(0, 100);
+    tester.Validate();
+
+    constexpr std::string_view kArchiveTag = "repeat_tag";
+    for (int i = 0; i < 2; ++i)
+    {
+        eloqstore::ArchiveRequest archive_req;
+        archive_req.SetTableId(test_tbl_id);
+        archive_req.SetTag(std::string(kArchiveTag));
+        bool ok = store->ExecAsyn(&archive_req);
+        REQUIRE(ok);
+        archive_req.Wait();
+        REQUIRE(archive_req.Error() == eloqstore::KvError::NoError);
+    }
+
+    const std::vector<std::string> cloud_files =
+        ListCloudFiles(cloud_archive_opts,
+                       cloud_archive_opts.cloud_store_path,
+                       test_tbl_id.ToString());
+    const std::string expected_archive =
+        eloqstore::ArchiveName(store->Term(), kArchiveTag);
+    REQUIRE(std::count(
+                cloud_files.begin(), cloud_files.end(), expected_archive) == 1);
+
+    store->Stop();
+}
+
 TEST_CASE("cloud global archive shares timestamp and filters partitions",
           "[cloud][archive][global]")
 {
@@ -916,13 +951,13 @@ TEST_CASE("cloud global archive shares timestamp and filters partitions",
 
     constexpr uint64_t kSnapshotTs = 987654321;
     eloqstore::GlobalArchiveRequest global_req;
-    global_req.SetSnapshotTimestamp(kSnapshotTs);
+    global_req.SetTag(std::to_string(kSnapshotTs));
     store->ExecSync(&global_req);
     REQUIRE(global_req.Error() == eloqstore::KvError::NoError);
 
-    auto collect_archive_timestamps = [&](const eloqstore::TableIdent &tbl_id)
+    auto collect_archive_tags = [&](const eloqstore::TableIdent &tbl_id)
     {
-        std::vector<uint64_t> timestamps;
+        std::vector<std::string> tags;
         auto files = ListCloudFiles(options, cloud_root, tbl_id.ToString());
         for (const auto &filename : files)
         {
@@ -932,12 +967,12 @@ TEST_CASE("cloud global archive shares timestamp and filters partitions",
             }
             auto [type, suffix] = eloqstore::ParseFileName(filename);
             uint64_t term = 0;
-            std::optional<uint64_t> ts;
-            REQUIRE(eloqstore::ParseManifestFileSuffix(suffix, term, ts));
-            REQUIRE(ts.has_value());
-            timestamps.push_back(*ts);
+            std::optional<std::string> tag;
+            REQUIRE(eloqstore::ParseManifestFileSuffix(suffix, term, tag));
+            REQUIRE(tag.has_value());
+            tags.push_back(*tag);
         }
-        return timestamps;
+        return tags;
     };
 
     auto wait_for_archive = [&](const eloqstore::TableIdent &tbl_id)
@@ -945,7 +980,7 @@ TEST_CASE("cloud global archive shares timestamp and filters partitions",
         return WaitForCondition(
             20s,
             200ms,
-            [&]() { return !collect_archive_timestamps(tbl_id).empty(); });
+            [&]() { return !collect_archive_tags(tbl_id).empty(); });
     };
 
     const std::vector<eloqstore::TableIdent> included_partitions = {
@@ -960,18 +995,18 @@ TEST_CASE("cloud global archive shares timestamp and filters partitions",
     for (const auto &tbl_id : included_partitions)
     {
         REQUIRE(wait_for_archive(tbl_id));
-        auto timestamps = collect_archive_timestamps(tbl_id);
-        REQUIRE_FALSE(timestamps.empty());
-        for (uint64_t ts : timestamps)
+        auto tags = collect_archive_tags(tbl_id);
+        REQUIRE_FALSE(tags.empty());
+        for (const auto &tag : tags)
         {
-            REQUIRE(ts == kSnapshotTs);
+            REQUIRE(tag == std::to_string(kSnapshotTs));
         }
     }
 
     for (const auto &tbl_id : excluded_partitions)
     {
-        auto timestamps = collect_archive_timestamps(tbl_id);
-        REQUIRE(timestamps.empty());
+        auto tags = collect_archive_tags(tbl_id);
+        REQUIRE(tags.empty());
     }
 }
 
@@ -1197,11 +1232,14 @@ TEST_CASE("cloud reopen refreshes local manifest from remote",
 
     // Restart without prewarm so it doesn't auto-download.
     REQUIRE(store->Start() == eloqstore::KvError::NoError);
+    REQUIRE(WaitForCondition(std::chrono::seconds(5),
+                             std::chrono::milliseconds(10),
+                             [&]() { return store->Inited(); }));
     {
         std::filesystem::path restored_manifest =
             std::filesystem::path(options.store_path.front()) /
             tbl_id.ToString() / manifest_name;
-        // Manifest should be removed to avoid to be outdated.
+        // Manifest should be removed to avoid being outdated before reopen.
         REQUIRE(!std::filesystem::exists(restored_manifest));
     }
 
@@ -1480,6 +1518,9 @@ TEST_CASE("cloud global reopen refreshes local manifests", "[cloud][reopen]")
     }
 
     REQUIRE(store->Start() == eloqstore::KvError::NoError);
+    REQUIRE(WaitForCondition(std::chrono::seconds(5),
+                             std::chrono::milliseconds(10),
+                             [&]() { return store->Inited(); }));
     for (size_t i = 0; i < tbl_ids.size(); ++i)
     {
         std::filesystem::path restored_manifest =

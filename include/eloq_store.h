@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -39,6 +40,7 @@ enum class RequestType : uint8_t
     Floor,
     Scan,
     ListObject,
+    ListStandbyPartition,
     BatchWrite,
     Reopen,
     Truncate,
@@ -48,7 +50,8 @@ enum class RequestType : uint8_t
     LocalGc,
     CleanExpired,
     GlobalArchive,
-    GlobalReopen
+    GlobalReopen,
+    GlobalListArchiveTags
 };
 
 inline const char *RequestTypeToString(RequestType type)
@@ -63,6 +66,8 @@ inline const char *RequestTypeToString(RequestType type)
         return "scan";
     case RequestType::ListObject:
         return "list_object";
+    case RequestType::ListStandbyPartition:
+        return "list_standby_partition";
     case RequestType::BatchWrite:
         return "batch_write";
     case RequestType::Reopen:
@@ -83,6 +88,8 @@ inline const char *RequestTypeToString(RequestType type)
         return "global_archive";
     case RequestType::GlobalReopen:
         return "global_reopen";
+    case RequestType::GlobalListArchiveTags:
+        return "global_list_archive_tags";
     default:
         return "unknown";
     }
@@ -125,6 +132,7 @@ protected:
     friend class Shard;
     friend class EloqStore;
     friend class PrewarmService;
+    friend class TaskManager;
 };
 
 class ReadRequest : public KvRequest
@@ -328,6 +336,28 @@ private:
     std::string next_continuation_token_;  // output token
 };
 
+class ListStandbyPartitionRequest : public KvRequest
+{
+public:
+    RequestType Type() const override
+    {
+        return RequestType::ListStandbyPartition;
+    }
+
+    explicit ListStandbyPartitionRequest(std::vector<std::string> *partitions)
+        : partitions_(partitions)
+    {
+    }
+
+    std::vector<std::string> *GetPartitions() const
+    {
+        return partitions_;
+    }
+
+private:
+    std::vector<std::string> *partitions_;
+};
+
 class WriteRequest : public KvRequest
 {
 public:
@@ -347,6 +377,20 @@ public:
         return RequestType::Reopen;
     }
     void SetArgs(TableIdent tbl_id);
+    void SetTag(std::string tag)
+    {
+        tag_ = std::move(tag);
+    }
+    const std::string &Tag() const
+    {
+        return tag_;
+    }
+
+private:
+    std::string tag_;
+
+    friend class EloqStore;
+    friend class ReopenTask;
 };
 
 /**
@@ -407,45 +451,105 @@ private:
 class ArchiveRequest : public WriteRequest
 {
 public:
+    enum class Action : uint8_t
+    {
+        Create = 0,
+        Delete = 1,
+    };
+
     RequestType Type() const override
     {
         return RequestType::Archive;
     }
 
-    void SetSnapshotTimestamp(uint64_t ts)
+    void SetTag(std::string tag)
     {
-        snapshot_ts_ = ts;
+        tag_ = std::move(tag);
+    }
+    [[deprecated("Use SetTag(std::string) instead.")]]
+    void SetSnapshotTimestamp(uint64_t ts);
+
+    const std::string &Tag() const
+    {
+        return tag_;
+    }
+    void SetTerm(uint64_t term)
+    {
+        term_ = term;
+    }
+    uint64_t Term() const
+    {
+        return term_;
     }
 
-    uint64_t GetSnapshotTimestamp() const
+    void SetAction(Action action)
     {
-        return snapshot_ts_;
+        action_ = action;
+    }
+
+    Action GetAction() const
+    {
+        return action_;
     }
 
 private:
-    uint64_t snapshot_ts_{0};
+    static constexpr uint64_t kUseProcessTerm =
+        std::numeric_limits<uint64_t>::max();
+    std::string tag_;
+    uint64_t term_{kUseProcessTerm};
+    Action action_{Action::Create};
 };
 
 class GlobalArchiveRequest : public KvRequest
 {
 public:
+    enum class Action : uint8_t
+    {
+        Create = 0,
+        Delete = 1,
+    };
+
     RequestType Type() const override
     {
         return RequestType::GlobalArchive;
     }
 
-    void SetSnapshotTimestamp(uint64_t ts)
+    void SetTag(std::string tag)
     {
-        snapshot_ts_ = ts;
+        tag_ = std::move(tag);
+    }
+    [[deprecated("Use SetTag(std::string) instead.")]]
+    void SetSnapshotTimestamp(uint64_t ts);
+
+    const std::string &Tag() const
+    {
+        return tag_;
+    }
+    void SetTerm(uint64_t term)
+    {
+        term_ = term;
+    }
+    uint64_t Term() const
+    {
+        return term_;
     }
 
-    uint64_t GetSnapshotTimestamp() const
+    void SetAction(Action action)
     {
-        return snapshot_ts_;
+        action_ = action;
+    }
+
+    Action GetAction() const
+    {
+        return action_;
     }
 
 private:
-    uint64_t snapshot_ts_{0};
+    static constexpr uint64_t kUseProcessTerm =
+        std::numeric_limits<uint64_t>::max();
+    std::string tag_;
+    uint64_t term_{kUseProcessTerm};
+    Action action_{Action::Create};
     std::vector<std::unique_ptr<ArchiveRequest>> archive_reqs_;
     std::atomic<uint32_t> pending_{0};
     std::atomic<uint8_t> first_error_{static_cast<uint8_t>(KvError::NoError)};
@@ -461,10 +565,54 @@ public:
         return RequestType::GlobalReopen;
     }
 
+    void SetTag(std::string tag)
+    {
+        tag_ = std::move(tag);
+    }
+    const std::string &Tag() const
+    {
+        return tag_;
+    }
+
 private:
+    std::string tag_;
     std::vector<std::unique_ptr<ReopenRequest>> reopen_reqs_;
     std::atomic<uint32_t> pending_{0};
     std::atomic<uint8_t> first_error_{static_cast<uint8_t>(KvError::NoError)};
+
+    friend class EloqStore;
+};
+
+class GlobalListArchiveTagsRequest : public KvRequest
+{
+public:
+    struct ArchiveEntry
+    {
+        uint64_t term{0};
+        std::string tag;
+    };
+
+    RequestType Type() const override
+    {
+        return RequestType::GlobalListArchiveTags;
+    }
+
+    void SetPrefix(std::string prefix)
+    {
+        prefix_ = std::move(prefix);
+    }
+    const std::string &Prefix() const
+    {
+        return prefix_;
+    }
+    const std::vector<ArchiveEntry> &Entries() const
+    {
+        return entries_;
+    }
+
+private:
+    std::string prefix_;
+    std::vector<ArchiveEntry> entries_;
 
     friend class EloqStore;
 };
@@ -501,10 +649,19 @@ class ObjectStore;
 class EloqStoreModule;
 class PrewarmService;
 class CloudStorageService;
+class StandbyService;
 
 class EloqStore
 {
 public:
+    enum class RunningStatus : uint8_t
+    {
+        Starting = 0,
+        Running = 1,
+        Stopping = 2,
+        Stopped = 3,
+    };
+
     EloqStore(const KvOptions &opts);
     EloqStore(const EloqStore &) = delete;
     EloqStore(EloqStore &&) = delete;
@@ -512,6 +669,7 @@ public:
     KvError Start(uint64_t term = 0);
     void Stop();
     bool IsStopped() const;
+    bool Inited() const;
     const KvOptions &Options() const;
     CloudStorageService *CloudService() const
     {
@@ -527,10 +685,24 @@ public:
         return prewarm_service_.get();
     }
 
+    StandbyService *GetStandbyService() const
+    {
+        return standby_service_.get();
+    }
+
+    StoreMode Mode() const
+    {
+        return store_mode_.load(std::memory_order_acquire);
+    }
+
     uint64_t Term() const
     {
         return term_;
     }
+
+    KvError UpdateStandbyMasterStorePaths(std::vector<std::string> paths,
+                                          std::vector<uint64_t> weights);
+    KvError UpdateStandbyMasterAddr(std::string standby_master_addr);
 
     /**
      * @brief Validate KvOptions configuration.
@@ -574,6 +746,7 @@ private:
     void HandleDropTableRequest(DropTableRequest *req);
     void HandleGlobalArchiveRequest(GlobalArchiveRequest *req);
     void HandleGlobalReopenRequest(GlobalReopenRequest *req);
+    void HandleGlobalListArchiveTagsRequest(GlobalListArchiveTagsRequest *req);
     KvError CollectTablePartitions(const std::string &table_name,
                                    std::vector<TableIdent> &partitions) const;
     KvError InitStoreSpace();
@@ -588,15 +761,18 @@ private:
 #ifdef ELOQSTORE_WITH_TXSERVICE
     std::vector<std::unique_ptr<metrics::Meter>> metrics_meters_;
 #endif
-    std::atomic<bool> stopped_{true};
+    std::atomic<uint8_t> running_status_{
+        static_cast<uint8_t>(RunningStatus::Stopped)};
     uint64_t term_{0};
     std::unique_ptr<ArchiveCrond> archive_crond_{nullptr};
     std::unique_ptr<PrewarmService> prewarm_service_{nullptr};
+    std::unique_ptr<StandbyService> standby_service_{nullptr};
 #ifdef ELOQ_MODULE_ENABLED
     std::unique_ptr<EloqStoreModule> module_{nullptr};
 #endif
 
     bool enable_eloqstore_metrics_{false};
+    std::atomic<StoreMode> store_mode_{StoreMode::Local};
 
     friend class Shard;
     friend class AsyncIoManager;

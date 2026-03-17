@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <boost/algorithm/string.hpp>
 #include <cctype>
 #include <charconv>
 #include <limits>
@@ -205,6 +204,11 @@ int KvOptions::LoadFromIni(const char *path)
         cloud_request_threads = reader.GetUnsigned(
             sec_run, "cloud_request_threads", cloud_request_threads);
     }
+    if (reader.HasValue(sec_run, "standby_max_concurrency"))
+    {
+        standby_max_concurrency = reader.GetUnsigned(
+            sec_run, "standby_max_concurrency", standby_max_concurrency);
+    }
     if (reader.HasValue(sec_run, "direct_io_buffer_pool_size"))
     {
         direct_io_buffer_pool_size = reader.GetUnsigned(
@@ -253,11 +257,37 @@ int KvOptions::LoadFromIni(const char *path)
     if (reader.HasValue(sec_permanent, "store_path"))
     {
         std::string input = reader.Get(sec_permanent, "store_path", "");
-        boost::split(store_path, input, boost::is_any_of(": "));
+        std::string error_message;
+        if (!ParseStorePathListWithWeights(
+                input, store_path, store_path_weights, &error_message))
+        {
+            LOG(ERROR) << "Invalid store_path: " << error_message;
+            return -3;
+        }
     }
     if (reader.HasValue(sec_permanent, "cloud_store_path"))
     {
         cloud_store_path = reader.Get(sec_permanent, "cloud_store_path", "");
+    }
+    if (reader.HasValue(sec_permanent, "standby_master_addr"))
+    {
+        standby_master_addr =
+            reader.Get(sec_permanent, "standby_master_addr", "");
+    }
+    if (reader.HasValue(sec_permanent, "standby_master_store_paths"))
+    {
+        std::string input =
+            reader.Get(sec_permanent, "standby_master_store_paths", "");
+        std::string error_message;
+        if (!ParseStorePathListWithWeights(input,
+                                           standby_master_store_paths,
+                                           standby_master_store_path_weights,
+                                           &error_message))
+        {
+            LOG(ERROR) << "Invalid standby_master_store_paths: "
+                       << error_message;
+            return -3;
+        }
     }
     if (reader.HasValue(sec_permanent, "cloud_provider"))
     {
@@ -368,6 +398,7 @@ bool KvOptions::operator==(const KvOptions &other) const
            max_cloud_concurrency == other.max_cloud_concurrency &&
            max_write_concurrency == other.max_write_concurrency &&
            cloud_request_threads == other.cloud_request_threads &&
+           standby_max_concurrency == other.standby_max_concurrency &&
            direct_io_buffer_pool_size == other.direct_io_buffer_pool_size &&
            write_buffer_size == other.write_buffer_size &&
            non_page_io_batch_size == other.non_page_io_batch_size &&
@@ -376,7 +407,12 @@ bool KvOptions::operator==(const KvOptions &other) const
            prewarm_cloud_cache == other.prewarm_cloud_cache &&
            prewarm_task_count == other.prewarm_task_count &&
            store_path == other.store_path &&
+           store_path_weights == other.store_path_weights &&
            cloud_store_path == other.cloud_store_path &&
+           standby_master_addr == other.standby_master_addr &&
+           standby_master_store_paths == other.standby_master_store_paths &&
+           standby_master_store_path_weights ==
+               other.standby_master_store_path_weights &&
            cloud_provider == other.cloud_provider &&
            cloud_endpoint == other.cloud_endpoint &&
            cloud_region == other.cloud_region &&

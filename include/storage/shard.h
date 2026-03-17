@@ -55,9 +55,7 @@ public:
     TaskManager *TaskMgr();
     PagesPool *PagePool();
 
-    bool oss_enabled_{false};
-    bool io_mgr_and_page_pool_inited_{false};
-    bool startup_restore_finished_{false};
+    std::atomic<bool> io_mgr_and_page_pool_inited_{false};
 
 #ifdef ELOQ_MODULE_ENABLED
     // 0 for running, 1 for to stop, 2 for stopped
@@ -75,7 +73,6 @@ public:
 private:
     void WorkLoop();
     void InitIoMgrAndPagePool();
-    void RunStartupRestore();
     bool ExecuteReadyTasks();
     void OnTaskFinished(KvTask *task);
     void OnReceivedReq(KvRequest *req);
@@ -185,6 +182,8 @@ private:
             return "scan";
         case RequestType::ListObject:
             return "list_object";
+        case RequestType::ListStandbyPartition:
+            return "list_standby_partition";
         case RequestType::Reopen:
             return "reopen";
         case RequestType::BatchWrite:

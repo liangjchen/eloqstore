@@ -6,7 +6,10 @@
 #include <liburing.h>
 #include <liburing/io_uring.h>
 #include <linux/openat2.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -37,6 +40,7 @@
 #include "utils.h"
 
 #ifdef ELOQ_MODULE_ENABLED
+#include <bthread/bthread.h>
 #include <bthread/eloq_module.h>
 #endif
 
@@ -48,10 +52,13 @@
 #include "eloq_store.h"
 #include "kill_point.h"
 #include "kv_options.h"
+#include "standby_service.h"
 #include "storage/root_meta.h"
 #include "storage/shard.h"
 #include "tasks/task.h"
 #include "tasks/write_task.h"
+
+extern char **environ;
 
 namespace eloqstore
 {
@@ -59,6 +66,8 @@ namespace fs = std::filesystem;
 
 namespace
 {
+constexpr std::string_view kManifestTmp = "manifest.tmp";
+
 WriteTask *CurrentWriteTask()
 {
     KvTask *task = ThdTask();
@@ -127,15 +136,24 @@ std::unique_ptr<AsyncIoManager> AsyncIoManager::Instance(const EloqStore *store,
     {
         return std::make_unique<MemStoreMgr>(opts);
     }
-    else if (opts->cloud_store_path.empty())
+    StoreMode mode = store->Mode();
+    std::unique_ptr<AsyncIoManager> mgr;
+    switch (mode)
     {
-        return std::make_unique<IouringMgr>(opts, fd_limit);
-    }
-    else
-    {
-        return std::make_unique<CloudStoreMgr>(
+    case StoreMode::Cloud:
+        mgr = std::make_unique<CloudStoreMgr>(
             opts, fd_limit, store->CloudService());
+        break;
+    case StoreMode::StandbyReplica:
+    case StoreMode::StandbyMaster:
+        mgr = std::make_unique<StandbyStoreMgr>(opts, fd_limit);
+        break;
+    case StoreMode::Local:
+    default:
+        mgr = std::make_unique<IouringMgr>(opts, fd_limit);
+        break;
     }
+    return mgr;
 }
 
 bool AsyncIoManager::IsIdle()
@@ -1065,9 +1083,9 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
     }
     else if (lru_fd.Get()->reg_idx_ >= 0)
     {
-        // Check for term mismatch in cloud mode.
-        const bool cloud_mode = !options_->cloud_store_path.empty();
-        if (cloud_mode && file_id != LruFD::kDirectory && term != 0)
+        // Check for term mismatch when not in local mode.
+        if (eloq_store->Mode() != StoreMode::Local &&
+            file_id != LruFD::kDirectory && term != 0)
         {
             uint64_t cached_term = lru_fd.Get()->term_;
             if (cached_term != 0 && cached_term != term)
@@ -1909,13 +1927,13 @@ bool IouringMgr::HasOtherFile(const TableIdent &tbl_id) const
             continue;
         }
         // Ignore current manifest files (manifest or manifest_<term>), but do
-        // NOT ignore archive manifests (manifest_<term>_<ts>).
+        // not ignore archive manifests (manifest_<term>_<tag>).
         auto [type, suffix] = ParseFileName(name);
         if (type == FileNameManifest)
         {
             uint64_t term = 0;
-            std::optional<uint64_t> ts;
-            if (ParseManifestFileSuffix(suffix, term, ts) && !ts.has_value())
+            std::optional<std::string> tag;
+            if (ParseManifestFileSuffix(suffix, term, tag) && !tag.has_value())
             {
                 continue;
             }
@@ -2147,18 +2165,37 @@ KvError IouringMgr::SwitchManifest(const TableIdent &tbl_id,
 
 KvError IouringMgr::CreateArchive(const TableIdent &tbl_id,
                                   std::string_view snapshot,
-                                  uint64_t ts)
+                                  std::string_view tag)
 {
     auto [dir_fd, err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
     CHECK_KV_ERR(err);
     uint64_t term = ProcessTerm();
-    const std::string name = ArchiveName(term, ts);
+    const std::string name = ArchiveName(term, tag);
     int res = WriteSnapshot(std::move(dir_fd), name, snapshot);
     if (res < 0)
     {
         return ToKvError(res);
     }
     CloseDirect(res);
+    return KvError::NoError;
+}
+
+KvError IouringMgr::DeleteArchive(const TableIdent &tbl_id,
+                                  uint64_t term,
+                                  std::string_view tag)
+{
+    auto [dir_fd, err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
+    CHECK_KV_ERR(err);
+    if (term == std::numeric_limits<uint64_t>::max())
+    {
+        term = ProcessTerm();
+    }
+    const std::string name = ArchiveName(term, tag);
+    const int res = UnlinkAt(dir_fd.FdPair(), name.c_str(), false);
+    if (res < 0 && res != -ENOENT)
+    {
+        return ToKvError(res);
+    }
     return KvError::NoError;
 }
 
@@ -3165,7 +3202,7 @@ void CloudStoreMgr::Stop()
     {
         prewarmer->Shutdown();
     }
-    if (cloud_service_)
+    if (cloud_service_ && !IsStoreStopping())
     {
         WaitForCloudTasksToDrain();
     }
@@ -3173,16 +3210,6 @@ void CloudStoreMgr::Stop()
     // ObjectStore::RunHttpWork(). Drain all cloud tasks first so Shutdown()
     // runs after workers finish in-flight work on this object store.
     obj_store_.Shutdown();
-}
-
-void CloudStoreMgr::Submit()
-{
-    IouringMgr::Submit();
-}
-
-void CloudStoreMgr::PollComplete()
-{
-    IouringMgr::PollComplete();
 }
 
 bool CloudStoreMgr::NeedPrewarm() const
@@ -3198,6 +3225,7 @@ void CloudStoreMgr::RunPrewarm()
     }
     for (auto &prewarmer : prewarmers_)
     {
+        prewarmer->stop_.store(false, std::memory_order_release);
         prewarmer->Resume();
     }
 }
@@ -3209,7 +3237,7 @@ void CloudStoreMgr::RegisterPrewarmActive()
 
 void CloudStoreMgr::UnregisterPrewarmActive()
 {
-    assert(active_prewarm_tasks_ > 0);
+    CHECK_GT(active_prewarm_tasks_, 0);
     --active_prewarm_tasks_;
 }
 
@@ -3220,43 +3248,21 @@ bool CloudStoreMgr::HasPrewarmPending() const
 
 bool CloudStoreMgr::PopPrewarmFile(PrewarmFile &file)
 {
-    // Lock-free dequeue from concurrent queue
     if (!prewarm_queue_.try_dequeue(file))
     {
         return false;
     }
-
-    // Update counters atomically
+    prewarm_queue_size_.fetch_sub(1, std::memory_order_acq_rel);
     prewarm_files_pulled_.fetch_add(1, std::memory_order_relaxed);
-
-    // Decrement size counter, but prevent underflow using compare-exchange
-    size_t old_size = prewarm_queue_size_.load(std::memory_order_acquire);
-    while (old_size > 0)
-    {
-        if (prewarm_queue_size_.compare_exchange_weak(
-                old_size,
-                old_size - 1,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire))
-        {
-            break;
-        }
-    }
-
     return true;
 }
 
 void CloudStoreMgr::ClearPrewarmFiles()
 {
-    // Drain all items from queue
     PrewarmFile dummy;
-    size_t drained = 0;
     while (prewarm_queue_.try_dequeue(dummy))
     {
-        ++drained;
     }
-
-    // Reset size counter
     prewarm_queue_size_.store(0, std::memory_order_release);
 }
 
@@ -3270,11 +3276,15 @@ void CloudStoreMgr::StopAllPrewarmTasks()
 
 void CloudStoreMgr::WaitForCloudTasksToDrain()
 {
-    constexpr auto kPollInterval = std::chrono::milliseconds(5);
-
     while (obj_store_.HasPendingWork() || inflight_cloud_slots_ > 0)
     {
+#ifdef ELOQ_MODULE_ENABLED
+        constexpr uint64_t kPollIntervalUs = 5000;
+        bthread_usleep(kPollIntervalUs);
+#else
+        constexpr auto kPollInterval = std::chrono::milliseconds(5);
         std::this_thread::sleep_for(kPollInterval);
+#endif
     }
 }
 
@@ -3310,6 +3320,7 @@ void CloudStoreMgr::ProcessCloudReadyTasks(Shard *shard)
         return;
     }
     ObjectStore::Task *ready_tasks[128];
+    CHECK(shard != nullptr);
     size_t nready = cloud_ready_tasks_.try_dequeue_bulk(ready_tasks,
                                                         std::size(ready_tasks));
     if (nready == 0)
@@ -3332,15 +3343,10 @@ bool CloudStoreMgr::AppendPrewarmFiles(std::vector<PrewarmFile> &files)
         return true;
     }
 
-    size_t num_files = files.size();
-
-    // Wake up worker before potentially blocking
-    // This ensures worker is actively draining queue if it was idle
 #ifdef ELOQ_MODULE_ENABLED
     eloq::EloqModule::NotifyWorker(shard_id_);
 #endif
 
-    // Wait until queue has space (only place we use mutex/CV)
     while (!prewarm_listing_complete_.load(std::memory_order_acquire))
     {
         size_t current_size =
@@ -3349,35 +3355,21 @@ bool CloudStoreMgr::AppendPrewarmFiles(std::vector<PrewarmFile> &files)
         {
             break;
         }
-
-        // Debug log
-        DLOG(INFO) << "Producer waiting: queue full with " << current_size
-                   << " pending files on shard " << shard_id_;
-
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    // Check if we were aborted
     if (prewarm_listing_complete_.load(std::memory_order_acquire))
     {
-        DLOG(INFO) << "Producer aborted: listing marked complete";
-        return false;  // Abort requested
+        return false;
     }
 
-    // Enqueue files (lock-free operation)
+    size_t num_files = files.size();
     prewarm_queue_.enqueue_bulk(std::make_move_iterator(files.begin()),
                                 num_files);
-
-    // Update size counter
     size_t prev_size =
         prewarm_queue_size_.fetch_add(num_files, std::memory_order_release);
-
     files.clear();
 
-    DLOG(INFO) << "Producer appended " << num_files << " to shard " << shard_id_
-               << " prewarm queue, current size: " << (prev_size + num_files);
-
-    // Wake up prewarmers if queue was empty
     if (prev_size == 0)
     {
         for (auto &prewarmer : prewarmers_)
@@ -3385,7 +3377,6 @@ bool CloudStoreMgr::AppendPrewarmFiles(std::vector<PrewarmFile> &files)
             prewarmer->stop_.store(false, std::memory_order_release);
         }
     }
-
     return true;
 }
 
@@ -3515,8 +3506,8 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::GetManifest(
     {
         // "name" does not contain the prefix("manifest_").
         uint64_t term = 0;
-        std::optional<uint64_t> ts;
-        if (!ParseManifestFileSuffix(name, term, ts))
+        std::optional<std::string> tag;
+        if (!ParseManifestFileSuffix(name, term, tag))
         {
             LOG(FATAL) << "CloudStoreMgr::GetManifest: failed to parse "
                           "manifest file suffix: "
@@ -3524,8 +3515,8 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::GetManifest(
             continue;
         }
 
-        // Skip archive manifests (manifest_<term>_<ts>).
-        if (ts.has_value())
+        // Skip archive manifests (manifest_<term>_<tag>).
+        if (tag.has_value())
         {
             continue;
         }
@@ -3656,9 +3647,188 @@ private:
 }  // namespace
 
 std::pair<ManifestFilePtr, KvError> CloudStoreMgr::RefreshManifest(
-    const TableIdent &tbl_id)
+    const TableIdent &tbl_id, std::string_view archive_tag)
 {
-    // Always fetch the latest manifest from cloud, even if local exists.
+    if (archive_tag.empty())
+    {
+        // Always fetch the latest manifest from cloud, even if local exists.
+        LruFD::Ref old_fd = GetOpenedFD(tbl_id, LruFD::kManifest);
+        if (old_fd != nullptr)
+        {
+            CloseFile(std::move(old_fd));
+        }
+
+        uint64_t process_term = ProcessTerm();
+        uint64_t selected_term = process_term;
+        DirectIoBuffer buffer;
+        auto download_to_buffer = [&](uint64_t term) -> KvError
+        {
+            KvTask *current_task = ThdTask();
+            std::string filename = ToFilename(LruFD::kManifest, term);
+            ObjectStore::DownloadTask download_task(&tbl_id, filename);
+            download_task.SetKvTask(current_task);
+            download_task.response_data_ =
+                std::move(direct_io_buffer_pool_.Acquire());
+            AcquireCloudSlot(current_task);
+            obj_store_.SubmitTask(&download_task, shard);
+            current_task->WaitIo();
+
+            if (download_task.error_ != KvError::NoError)
+            {
+                RecycleBuffer(std::move(download_task.response_data_));
+                return download_task.error_;
+            }
+            buffer = std::move(download_task.response_data_);
+            return KvError::NoError;
+        };
+
+        KvError dl_err = download_to_buffer(process_term);
+        if (dl_err == KvError::NotFound)
+        {
+            uint64_t best_term = 0;
+            bool found = false;
+            std::vector<std::string> cloud_files;
+            std::string remote_path =
+                tbl_id.ToString() + "/" + FileNameManifest + FileNameSeparator;
+
+            std::string continuation_token;
+            KvTask *current_task = ThdTask();
+            do
+            {
+                ObjectStore::ListTask list_task(remote_path, false);
+                list_task.SetContinuationToken(continuation_token);
+                list_task.SetKvTask(current_task);
+                AcquireCloudSlot(current_task);
+                obj_store_.SubmitTask(&list_task, shard);
+                current_task->WaitIo();
+
+                if (list_task.error_ != KvError::NoError)
+                {
+                    LOG(ERROR)
+                        << "CloudStoreMgr::RefreshManifest: list objects "
+                           "failed for "
+                        << tbl_id << " : " << ErrorString(list_task.error_);
+                    return {nullptr, list_task.error_};
+                }
+
+                std::vector<std::string> batch_files;
+                std::string next_token;
+                if (!obj_store_.ParseListObjectsResponse(
+                        list_task.response_data_.view(),
+                        list_task.json_data_,
+                        &batch_files,
+                        nullptr,
+                        &next_token))
+                {
+                    LOG(ERROR) << "CloudStoreMgr::RefreshManifest: parse list "
+                                  "response failed for table "
+                               << tbl_id;
+                    return {nullptr, KvError::Corrupted};
+                }
+
+                cloud_files.insert(cloud_files.end(),
+                                   std::make_move_iterator(batch_files.begin()),
+                                   std::make_move_iterator(batch_files.end()));
+                continuation_token = std::move(next_token);
+            } while (!continuation_token.empty());
+
+            if (cloud_files.empty() || (cloud_files.size() == 1 &&
+                                        cloud_files[0] == CurrentTermFileName))
+            {
+                return {nullptr, KvError::NotFound};
+            }
+
+            for (const std::string &name : cloud_files)
+            {
+                uint64_t term = 0;
+                std::optional<std::string> tag;
+                if (!ParseManifestFileSuffix(name, term, tag))
+                {
+                    LOG(FATAL) << "CloudStoreMgr::RefreshManifest: failed to "
+                                  "parse manifest file suffix: "
+                               << name;
+                    continue;
+                }
+                if (tag.has_value())
+                {
+                    continue;
+                }
+                if (term >= best_term)
+                {
+                    found = true;
+                    best_term = term;
+                }
+            }
+
+            if (!found)
+            {
+                return {nullptr, KvError::NotFound};
+            }
+            selected_term = best_term;
+            dl_err = download_to_buffer(selected_term);
+        }
+
+        if (dl_err != KvError::NoError)
+        {
+            return {nullptr, dl_err};
+        }
+
+        BufferManifest buffer_manifest(buffer.view());
+        Replayer replayer(options_);
+        KvError replay_err = replayer.Replay(&buffer_manifest);
+        if (replay_err != KvError::NoError)
+        {
+            RecycleBuffer(std::move(buffer));
+            return {nullptr, replay_err};
+        }
+
+        std::string tmp_name = ManifestFileName(selected_term) + ".tmp";
+        uint64_t flags = O_WRONLY | O_CREAT | O_DIRECT | O_NOATIME | O_TRUNC;
+        KvError write_err = WriteFile(tbl_id, tmp_name, buffer, flags);
+        RecycleBuffer(std::move(buffer));
+        if (write_err != KvError::NoError)
+        {
+            return {nullptr, write_err};
+        }
+
+        auto [dir_fd, dir_err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
+        if (dir_err != KvError::NoError)
+        {
+            return {nullptr, dir_err};
+        }
+
+        std::string manifest_name = ManifestFileName(selected_term);
+        int res =
+            Rename(dir_fd.FdPair(), tmp_name.c_str(), manifest_name.c_str());
+        if (res < 0)
+        {
+            return {nullptr, ToKvError(res)};
+        }
+        res = Fdatasync(dir_fd.FdPair());
+        if (res < 0)
+        {
+            return {nullptr, ToKvError(res)};
+        }
+
+        if (selected_term != process_term)
+        {
+            std::string promoted_name = ManifestFileName(process_term);
+            res = Rename(
+                dir_fd.FdPair(), manifest_name.c_str(), promoted_name.c_str());
+            if (res < 0)
+            {
+                return {nullptr, ToKvError(res)};
+            }
+            res = Fdatasync(dir_fd.FdPair());
+            if (res < 0)
+            {
+                return {nullptr, ToKvError(res)};
+            }
+        }
+
+        return IouringMgr::GetManifest(tbl_id);
+    }
+
     LruFD::Ref old_fd = GetOpenedFD(tbl_id, LruFD::kManifest);
     if (old_fd != nullptr)
     {
@@ -3667,12 +3837,12 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::RefreshManifest(
 
     uint64_t process_term = ProcessTerm();
     uint64_t selected_term = process_term;
+    std::string selected_filename = ArchiveName(selected_term, archive_tag);
     DirectIoBuffer buffer;
-    auto download_to_buffer = [&](uint64_t term) -> KvError
+    auto download_to_buffer = [&](std::string_view filename) -> KvError
     {
         KvTask *current_task = ThdTask();
-        std::string filename = ToFilename(LruFD::kManifest, term);
-        ObjectStore::DownloadTask download_task(&tbl_id, filename);
+        ObjectStore::DownloadTask download_task(&tbl_id, std::string(filename));
         download_task.SetKvTask(current_task);
         download_task.response_data_ = AcquireCloudBuffer(current_task);
         AcquireCloudSlot(current_task);
@@ -3688,93 +3858,7 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::RefreshManifest(
         return KvError::NoError;
     };
 
-    KvError dl_err = download_to_buffer(process_term);
-    if (dl_err == KvError::NotFound)
-    {
-        // List manifests in cloud and pick the term (ignoring archive files).
-        uint64_t best_term = 0;
-        bool found = false;
-        std::vector<std::string> cloud_files;
-        std::string remote_path =
-            tbl_id.ToString() + "/" + FileNameManifest + FileNameSeparator;
-
-        std::string continuation_token;
-        KvTask *current_task = ThdTask();
-        do
-        {
-            ObjectStore::ListTask list_task(remote_path, false);
-            list_task.SetContinuationToken(continuation_token);
-            list_task.SetKvTask(current_task);
-            AcquireCloudSlot(current_task);
-            obj_store_.SubmitTask(&list_task, shard);
-            current_task->WaitIo();
-
-            if (list_task.error_ != KvError::NoError)
-            {
-                LOG(ERROR)
-                    << "CloudStoreMgr::RefreshManifest: list objects failed "
-                    << "for " << tbl_id << " : "
-                    << ErrorString(list_task.error_);
-                return {nullptr, list_task.error_};
-            }
-
-            std::vector<std::string> batch_files;
-            std::string next_token;
-            if (!obj_store_.ParseListObjectsResponse(
-                    list_task.response_data_.view(),
-                    list_task.json_data_,
-                    &batch_files,
-                    nullptr,
-                    &next_token))
-            {
-                LOG(ERROR) << "CloudStoreMgr::RefreshManifest: parse list "
-                              "response failed for table "
-                           << tbl_id;
-                return {nullptr, KvError::Corrupted};
-            }
-
-            cloud_files.insert(cloud_files.end(),
-                               std::make_move_iterator(batch_files.begin()),
-                               std::make_move_iterator(batch_files.end()));
-            continuation_token = std::move(next_token);
-        } while (!continuation_token.empty());
-
-        if (cloud_files.empty() ||
-            (cloud_files.size() == 1 && cloud_files[0] == CurrentTermFileName))
-        {
-            return {nullptr, KvError::NotFound};
-        }
-
-        for (const std::string &name : cloud_files)
-        {
-            uint64_t term = 0;
-            std::optional<uint64_t> ts;
-            if (!ParseManifestFileSuffix(name, term, ts))
-            {
-                LOG(FATAL) << "CloudStoreMgr::RefreshManifest: failed to "
-                              "parse manifest file suffix: "
-                           << name;
-                continue;
-            }
-            if (ts.has_value())
-            {
-                continue;
-            }
-            if (term >= best_term)
-            {
-                found = true;
-                best_term = term;
-            }
-        }
-
-        if (!found)
-        {
-            return {nullptr, KvError::NotFound};
-        }
-        selected_term = best_term;
-        dl_err = download_to_buffer(selected_term);
-    }
-
+    KvError dl_err = download_to_buffer(selected_filename);
     if (dl_err != KvError::NoError)
     {
         return {nullptr, dl_err};
@@ -4105,27 +4189,76 @@ void CloudStoreMgr::CleanManifest(const TableIdent &tbl_id)
 
 KvError CloudStoreMgr::CreateArchive(const TableIdent &tbl_id,
                                      std::string_view snapshot,
-                                     uint64_t ts)
+                                     std::string_view tag)
 {
+    uint64_t term = ProcessTerm();
+    FileKey key(tbl_id, ArchiveName(term, tag));
+    bool dequed = DequeClosedFile(key);
+    if (dequed)
+    {
+        LOG(WARNING) << "CreateArchive found existing archive in closed cache, "
+                        "table="
+                     << tbl_id << " filename=" << key.filename_;
+    }
+    if (!dequed)
+    {
+        int res = ReserveCacheSpace(options_->manifest_limit);
+        if (res < 0)
+        {
+            return ToKvError(res);
+        }
+    }
+
     auto [dir_fd, err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
     CHECK_KV_ERR(err);
-    int res = ReserveCacheSpace(options_->manifest_limit);
+    int res = WriteSnapshot(std::move(dir_fd), key.filename_, snapshot);
     if (res < 0)
     {
+        if (dequed)
+        {
+            EnqueClosedFile(std::move(key));
+        }
         return ToKvError(res);
     }
-    uint64_t term = ProcessTerm();
-    const std::string name = ArchiveName(term, ts);
-    res = WriteSnapshot(std::move(dir_fd), name, snapshot);
-    if (res < 0)
-    {
-        return ToKvError(res);
-    }
-    err = UploadFile(tbl_id, name, nullptr, snapshot);
+
+    err = UploadFile(tbl_id, key.filename_, nullptr, snapshot);
     IouringMgr::CloseDirect(res);
-    used_local_space_ += options_->manifest_limit;
-    EnqueClosedFile(FileKey(tbl_id, name));
+    if (!dequed)
+    {
+        used_local_space_ += options_->manifest_limit;
+    }
+    EnqueClosedFile(std::move(key));
     return err;
+}
+
+KvError CloudStoreMgr::DeleteArchive(const TableIdent &tbl_id,
+                                     uint64_t term,
+                                     std::string_view tag)
+{
+    if (term == std::numeric_limits<uint64_t>::max())
+    {
+        term = ProcessTerm();
+    }
+    const std::string name = ArchiveName(term, tag);
+    auto [dir_fd, open_err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
+    CHECK_KV_ERR(open_err);
+    const int local_unlink_res = UnlinkAt(dir_fd.FdPair(), name.c_str(), false);
+    if (local_unlink_res < 0 && local_unlink_res != -ENOENT)
+    {
+        return ToKvError(local_unlink_res);
+    }
+
+    KvTask *current_task = ThdTask();
+    ObjectStore::DeleteTask delete_task(tbl_id.ToString() + "/" + name);
+    delete_task.SetKvTask(current_task);
+    AcquireCloudSlot(current_task);
+    obj_store_.SubmitTask(&delete_task, shard);
+    current_task->WaitIo();
+    if (delete_task.error_ == KvError::NotFound)
+    {
+        return KvError::NoError;
+    }
+    return delete_task.error_;
 }
 
 KvError CloudStoreMgr::AbortWrite(const TableIdent &tbl_id)
@@ -4304,19 +4437,6 @@ KvError CloudStoreMgr::CloseFile(LruFD::Ref fd)
     return KvError::NoError;
 }
 
-std::string CloudStoreMgr::ToFilename(FileId file_id, uint64_t term)
-{
-    if (file_id == LruFD::kManifest)
-    {
-        return ManifestFileName(term);
-    }
-    else
-    {
-        assert(file_id <= LruFD::kMaxDataFile);
-        return DataFileName(file_id, term);
-    }
-}
-
 size_t CloudStoreMgr::EstimateFileSize(FileId file_id) const
 {
     if (file_id == LruFD::kManifest)
@@ -4484,6 +4604,248 @@ KvError CloudStoreMgr::DownloadFile(const TableIdent &tbl_id,
         return ToKvError(res);
     }
     return KvError::NoError;
+}
+
+StandbyStoreMgr::StandbyStoreMgr(const KvOptions *opts, uint32_t fd_limit)
+    : IouringMgr(opts, fd_limit)
+{
+    CHECK(opts != nullptr);
+    const std::string &addr = opts->standby_master_addr;
+    if (addr.empty())
+        return;
+    remote_addr_ = addr;
+    LOG(INFO) << "StandbyStoreMgr replicating from " << remote_addr_;
+}
+
+void StandbyStoreMgr::Stop()
+{
+    if (!IsStoreStopping())
+    {
+        WaitForStandbyTasksToDrain();
+    }
+}
+
+void StandbyStoreMgr::WaitForStandbyTasksToDrain()
+{
+    while (inflight_standby_tasks_.load(std::memory_order_acquire) > 0)
+    {
+#ifdef ELOQ_MODULE_ENABLED
+        constexpr uint64_t kPollIntervalUs = 5000;
+        bthread_usleep(kPollIntervalUs);
+#else
+        constexpr auto kPollInterval = std::chrono::milliseconds(5);
+        std::this_thread::sleep_for(kPollInterval);
+#endif
+    }
+}
+
+std::pair<ManifestFilePtr, KvError> StandbyStoreMgr::GetManifest(
+    const TableIdent &tbl_id)
+{
+    auto [manifest, err] = IouringMgr::GetManifest(tbl_id);
+    if (err != KvError::NotFound)
+    {
+        if (err != KvError::NoError)
+        {
+            DLOG(INFO) << "StandbyStoreMgr::GetManifest direct load failed for "
+                       << tbl_id << ", process_term=" << ProcessTerm()
+                       << ", err=" << ErrorString(err);
+        }
+        return {std::move(manifest), err};
+    }
+    StandbyService *standby_service = shard->store_->GetStandbyService();
+    if (standby_service == nullptr)
+    {
+        return {nullptr, KvError::InvalidArgs};
+    }
+    KvTask *current_task = ThdTask();
+    if (current_task == nullptr)
+    {
+        return {nullptr, KvError::InvalidArgs};
+    }
+
+    const uint64_t target_term = ProcessTerm();
+    uint64_t source_term = 0;
+    KvError prep_err = standby_service->PrepareLocalManifest(
+        tbl_id, target_term, &source_term);
+    if (prep_err != KvError::NoError)
+    {
+        return {nullptr, prep_err};
+    }
+    current_task->WaitIo();
+    prep_err = static_cast<KvError>(current_task->io_res_);
+    if (prep_err != KvError::NoError)
+    {
+        return {nullptr, prep_err};
+    }
+    DLOG(INFO) << "StandbyStoreMgr::GetManifest fallback prepared manifest_"
+               << target_term << " from source term " << source_term << " for "
+               << tbl_id;
+    return IouringMgr::GetManifest(tbl_id);
+}
+
+std::string StandbyStoreMgr::BuildRemoteFilePath(
+    const TableIdent &tbl_id, std::string_view filename) const
+{
+    size_t remote_path_idx =
+        tbl_id.StorePathIndex(options_->standby_master_store_paths.size(),
+                              options_->standby_master_store_path_lut);
+    CHECK_LT(remote_path_idx, options_->standby_master_store_paths.size());
+    std::string remote_path =
+        options_->standby_master_store_paths[remote_path_idx];
+    while (remote_path.size() > 1 && remote_path.back() == '/')
+    {
+        remote_path.pop_back();
+    }
+    if (!remote_path.empty() && remote_path.back() != '/')
+    {
+        remote_path.push_back('/');
+    }
+    remote_path.append(tbl_id.ToString());
+    remote_path.push_back('/');
+    remote_path.append(filename);
+    std::string remote;
+    if (remote_addr_.empty() || remote_addr_ == "local")
+    {
+        remote = std::move(remote_path);
+    }
+    else
+    {
+        remote = remote_addr_;
+        remote.push_back(':');
+        remote.append(remote_path);
+    }
+    return remote;
+}
+
+int StandbyStoreMgr::RunRsync(const std::string &remote, const std::string &dst)
+{
+    constexpr auto kPollInterval = std::chrono::milliseconds(100);
+    constexpr auto kRsyncTimeout = std::chrono::minutes(5);
+
+    inflight_standby_tasks_.fetch_add(1, std::memory_order_acq_rel);
+    struct InflightTaskGuard
+    {
+        std::atomic<size_t> *counter;
+        ~InflightTaskGuard()
+        {
+            counter->fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } guard{&inflight_standby_tasks_};
+
+    char *const argv[] = {const_cast<char *>("rsync"),
+                          const_cast<char *>("-a"),
+                          const_cast<char *>("-z"),
+                          const_cast<char *>("--inplace"),
+                          const_cast<char *>(remote.c_str()),
+                          const_cast<char *>(dst.c_str()),
+                          nullptr};
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, "rsync", nullptr, nullptr, argv, environ);
+    if (rc != 0)
+    {
+        LOG(ERROR) << "posix_spawnp rsync failed: " << strerror(rc);
+        return -1;
+    }
+
+    int status = 0;
+    const auto deadline = std::chrono::steady_clock::now() + kRsyncTimeout;
+    while (true)
+    {
+        int wp = waitpid(pid, &status, WNOHANG);
+        if (wp == pid)
+        {
+            break;
+        }
+        if (wp < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            LOG(ERROR) << "waitpid for rsync failed: " << strerror(errno);
+            return -1;
+        }
+
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
+            {
+                LOG(ERROR) << "failed to kill timed out rsync process: "
+                           << strerror(errno);
+            }
+            while (waitpid(pid, &status, 0) < 0)
+            {
+                if (errno != EINTR)
+                {
+                    LOG(ERROR) << "waitpid after timed out rsync failed: "
+                               << strerror(errno);
+                    break;
+                }
+            }
+            LOG(ERROR) << "rsync timed out after "
+                       << std::chrono::duration_cast<std::chrono::milliseconds>(
+                              kRsyncTimeout)
+                              .count()
+                       << "ms";
+            return -1;
+        }
+        std::this_thread::sleep_for(kPollInterval);
+    }
+    if (WIFEXITED(status))
+    {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status))
+    {
+        return -WTERMSIG(status);
+    }
+    return -1;
+}
+
+std::pair<ManifestFilePtr, KvError> StandbyStoreMgr::RefreshManifest(
+    const TableIdent &tbl_id)
+{
+    LruFD::Ref old_fd = GetOpenedFD(tbl_id, LruFD::kManifest);
+    if (old_fd != nullptr)
+    {
+        CloseFile(std::move(old_fd));
+    }
+
+    fs::path table_dir =
+        tbl_id.StorePath(options_->store_path, options_->store_path_lut);
+    fs::path manifest_tmp = table_dir / kManifestTmp;
+    if (!fs::exists(manifest_tmp))
+    {
+        LOG(ERROR) << "StandbyStoreMgr: manifest.tmp missing for " << tbl_id;
+        return {nullptr, KvError::NotFound};
+    }
+
+    uint64_t term = ProcessTerm();
+    fs::path manifest_dst = table_dir / ManifestFileName(term);
+    auto [dir_fd, dir_err] = OpenFD(tbl_id, LruFD::kDirectory, false, 0);
+    if (dir_err != KvError::NoError)
+    {
+        return {nullptr, dir_err};
+    }
+    int rename_res = Rename(
+        dir_fd.FdPair(), kManifestTmp.data(), manifest_dst.filename().c_str());
+    if (rename_res < 0)
+    {
+        LOG(ERROR) << "StandbyStoreMgr: rename manifest failed: "
+                   << strerror(-rename_res);
+        return {nullptr, ToKvError(rename_res)};
+    }
+    int sync_res = Fdatasync(dir_fd.FdPair());
+    if (sync_res < 0)
+    {
+        LOG(ERROR) << "StandbyStoreMgr: fsync directory failed: "
+                   << strerror(-sync_res);
+        return {nullptr, ToKvError(sync_res)};
+    }
+
+    SetFileIdTerm(tbl_id, LruFD::kManifest, term);
+    return IouringMgr::GetManifest(tbl_id);
 }
 
 DirectIoBuffer CloudStoreMgr::AcquireCloudBuffer(KvTask *task)
@@ -5112,8 +5474,22 @@ KvError MemStoreMgr::SwitchManifest(const TableIdent &tbl_id,
 
 KvError MemStoreMgr::CreateArchive(const TableIdent &tbl_id,
                                    std::string_view snapshot,
-                                   uint64_t ts)
+                                   std::string_view tag)
 {
+    (void) tbl_id;
+    (void) snapshot;
+    (void) tag;
+    LOG(FATAL) << "not implemented";
+    return KvError::InvalidArgs;
+}
+
+KvError MemStoreMgr::DeleteArchive(const TableIdent &tbl_id,
+                                   uint64_t term,
+                                   std::string_view tag)
+{
+    (void) tbl_id;
+    (void) term;
+    (void) tag;
     LOG(FATAL) << "not implemented";
     return KvError::InvalidArgs;
 }

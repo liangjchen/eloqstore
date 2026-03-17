@@ -124,6 +124,11 @@ struct KvOptions
      */
     uint16_t cloud_request_threads = 1;
     /**
+     * @brief Maximum number of concurrent standby rsync/ssh child processes
+     * managed by the single standby supervisor thread.
+     */
+    uint16_t standby_max_concurrency = 1;
+    /**
      * @brief Max cached DirectIO buffers per shard.
      */
     uint32_t direct_io_buffer_pool_size = 16;
@@ -161,8 +166,16 @@ struct KvOptions
      */
     std::vector<std::string> store_path;
     /**
+     * @brief Optional per-store-path weights used to compute the LUT.
+     * Parsed from `store_path` suffix `:<w1,w2,...>`.
+     * When specified the weights vector must match store_path in size and the
+     * automatic disk-capacity based detection will be skipped.
+     */
+    std::vector<uint64_t> store_path_weights;
+    /**
      * @brief Lookup table that maps partition ids to store_path indexes.
      * Built during initialization to honor disk-capacity based weights.
+     * (automatically calculated)
      */
     std::vector<uint32_t> store_path_lut;
     /**
@@ -196,6 +209,36 @@ struct KvOptions
      * instance metadata rather than using cloud_access_key/cloud_secret_key.
      */
     bool cloud_auto_credentials = false;
+    /**
+     * @brief Enable standby replication mode in local storage. Cloud mode
+     * support standby feature automatically.
+     */
+    bool enable_local_standby = false;
+    /**
+     * @brief Standby source for local standby replication.
+     * When populated the store runs in standby mode and rsyncs files from the
+     * specified source instead of using cloud storage.
+     * Examples:
+     * - local
+     * - username@host_addr
+     */
+    std::string standby_master_addr;
+    /**
+     * @brief Remote store path list for the master when running in standby
+     * replica mode. These must be absolute paths and correspond to the master
+     * store paths selected by standby_master_store_path_lut.
+     */
+    std::vector<std::string> standby_master_store_paths;
+    /**
+     * @brief store_path_weights of master in standby mode.
+     * Parsed from `standby_master_store_paths` suffix `:<w1,w2,...>`.
+     */
+    std::vector<uint64_t> standby_master_store_path_weights;
+    /**
+     * @brief store_path_lut of master in standby mode. (automatically
+     * calculated)
+     */
+    std::vector<uint32_t> standby_master_store_path_lut;
     /**
      * @brief Whether to verify TLS certificates when talking to the cloud
      * endpoint.
