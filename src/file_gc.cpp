@@ -8,7 +8,6 @@
 #include <iterator>
 #include <memory>
 #include <optional>
-#include <random>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -230,6 +229,75 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
         return err;
     }
 
+    // If the partition is now empty except for the current manifest, clean the
+    // manifest as well so the local directory can be removed without waiting
+    // for later root-meta eviction.
+    local_files.clear();
+    err = ListLocalFiles(tbl_id, local_files, io_mgr);
+    if (err != KvError::NoError)
+    {
+        LOG(ERROR) << "ExecuteLocalGC: post-delete ListLocalFiles failed, "
+                   << "error=" << static_cast<int>(err);
+        return err;
+    }
+
+    archive_files.clear();
+    archive_tags.clear();
+    archive_branch_names.clear();
+    data_files.clear();
+    manifest_terms.clear();
+    manifest_branch_names.clear();
+    ClassifyFiles(local_files,
+                  archive_files,
+                  archive_tags,
+                  archive_branch_names,
+                  data_files,
+                  manifest_terms,
+                  manifest_branch_names);
+
+    if (data_files.empty() && archive_files.empty())
+    {
+        const StoreMode mode = eloq_store->Mode();
+        if (mode == StoreMode::Cloud)
+        {
+            auto *cloud_mgr = static_cast<CloudStoreMgr *>(io_mgr);
+            err = cloud_mgr->CleanupLocalPartitionFiles(tbl_id);
+            if (err != KvError::NoError)
+            {
+                LOG(ERROR)
+                    << "ExecuteLocalGC: CleanupLocalPartitionFiles failed, "
+                    << "error=" << static_cast<int>(err);
+                return err;
+            }
+        }
+        else
+        {
+            err = io_mgr->CleanManifest(tbl_id);
+            if (err != KvError::NoError)
+            {
+                LOG(ERROR) << "ExecuteLocalGC: CleanManifest failed, error="
+                           << static_cast<int>(err);
+                return err;
+            }
+
+            CHECK(shard != nullptr);
+            RootMetaMgr *root_meta_mgr =
+                shard->IndexManager()->RootMetaManager();
+            auto *entry = root_meta_mgr->Find(tbl_id);
+            if (entry != nullptr)
+            {
+                RootMeta &meta = entry->meta_;
+                if (meta.mapper_ != nullptr && meta.manifest_size_ != 0 &&
+                    meta.root_id_ == MaxPageId &&
+                    meta.ttl_root_id_ == MaxPageId &&
+                    meta.mapper_->MappingCount() == 0)
+                {
+                    meta.manifest_size_ = 0;
+                }
+            }
+        }
+    }
+
     /*
     // 4. delete old archives beyond num_retained_archives per branch.
     // NOTE: this step is intentionally AFTER DeleteUnreferencedLocalFiles so
@@ -392,29 +460,10 @@ void ClassifyFiles(const std::vector<std::string> &files,
     }
 }
 
-// Generate a random string of given length
-static std::string GenerateRandomString(size_t length)
-{
-    static const char alphanum[] =
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    static thread_local std::mt19937 rng{std::random_device{}()};
-    static thread_local std::uniform_int_distribution<size_t> dist(
-        0, sizeof(alphanum) - 2);
-
-    std::string result;
-    result.reserve(length);
-    for (size_t i = 0; i < length; ++i)
-    {
-        result += alphanum[dist(rng)];
-    }
-    return result;
-}
-
 KvError ReadCloudFile(const TableIdent &tbl_id,
                       const std::string &cloud_file,
                       DirectIoBuffer &content,
-                      CloudStoreMgr *cloud_mgr,
-                      const KvOptions *options)
+                      CloudStoreMgr *cloud_mgr)
 {
     KvTask *current_task = ThdTask();
 
@@ -434,44 +483,7 @@ KvError ReadCloudFile(const TableIdent &tbl_id,
                    << ", error: " << static_cast<int>(download_task.error_);
         return download_task.error_;
     }
-
-    // Generate a unique temporary filename to avoid conflicts with existing
-    // files
-    std::string temp_filename = cloud_file + ".tmp_" + GenerateRandomString(8);
-    fs::path temp_local_path =
-        tbl_id.StorePath(options->store_path, options->store_path_lut) /
-        temp_filename;
-
-    uint64_t flags = O_WRONLY | O_CREAT | O_DIRECT | O_NOATIME | O_TRUNC;
-    KvError write_err = cloud_mgr->WriteFile(
-        tbl_id, temp_filename, download_task.response_data_, flags);
-    cloud_mgr->RecycleBuffer(std::move(download_task.response_data_));
-    if (write_err != KvError::NoError)
-    {
-        LOG(ERROR) << "Failed to persist cloud file to temp path: "
-                   << temp_local_path
-                   << ", error: " << static_cast<int>(write_err);
-        return write_err;
-    }
-
-    // Read the temp file and then delete it
-    KvError err = cloud_mgr->ReadFile(tbl_id, temp_filename, content);
-    if (err != KvError::NoError)
-    {
-        LOG(ERROR) << "Failed to read temp file: " << temp_local_path
-                   << ", error: " << static_cast<int>(err);
-        // Try to clean up the temp file even if read failed
-        cloud_mgr->DeleteFiles({temp_local_path.string()});
-        return err;
-    }
-
-    // Delete the temp file
-    KvError delete_err = cloud_mgr->DeleteFiles({temp_local_path.string()});
-    if (delete_err != KvError::NoError)
-    {
-        LOG(WARNING) << "Failed to delete temp file: " << temp_local_path
-                     << ", error: " << static_cast<int>(delete_err);
-    }
+    content = std::move(download_task.response_data_);
 
     DLOG(INFO) << "Successfully downloaded and read cloud file: " << cloud_file;
     return KvError::NoError;
@@ -537,7 +549,7 @@ KvError AugmentRetainedFilesFromBranchManifests(
     assert(manifest_branch_names.size() == manifest_terms.size());
     assert(archive_files.size() == archive_branch_names.size());
 
-    bool is_cloud = !io_mgr->options_->cloud_store_path.empty();
+    bool is_cloud = eloq_store->Mode() == StoreMode::Cloud;
     CloudStoreMgr *cloud_mgr =
         is_cloud ? static_cast<CloudStoreMgr *>(io_mgr) : nullptr;
 
@@ -553,33 +565,42 @@ KvError AugmentRetainedFilesFromBranchManifests(
 
         if (is_cloud)
         {
-            err = ReadCloudFile(
-                tbl_id, filename, buf, cloud_mgr, cloud_mgr->options_);
+            err = ReadCloudFile(tbl_id, filename, buf, cloud_mgr);
         }
         else
         {
             err = io_mgr->ReadFile(tbl_id, filename, buf);
         }
 
-        if (err != KvError::NoError)
+        if (err == KvError::NoError)
         {
-            LOG(WARNING)
-                << "AugmentRetainedFilesFromBranchManifests: failed to read "
-                   "manifest "
-                << filename << " for branch " << branch << " term " << term
-                << ", error=" << static_cast<int>(err);
+            err = ProcessOneManifest(filename,
+                                     term,
+                                     buf,
+                                     retained_files,
+                                     max_file_id_per_branch_term,
+                                     pages_per_file_shift);
+            if (err != KvError::NoError)
+            {
+                return err;
+            }
+        }
+        else if (err != KvError::NotFound)
+        {
+            LOG(WARNING) << "AugmentRetainedFilesFromBranchManifests: "
+                            "failed to read "
+                            "manifest "
+                         << filename << " for branch " << branch << " term "
+                         << term << ", error=" << static_cast<int>(err);
             return err;
         }
-
-        err = ProcessOneManifest(filename,
-                                 term,
-                                 buf,
-                                 retained_files,
-                                 max_file_id_per_branch_term,
-                                 pages_per_file_shift);
-        if (err != KvError::NoError)
+        else
         {
-            return err;
+            LOG(ERROR) << "AugmentRetainedFilesFromBranchManifests: manifest "
+                       << filename << " for branch " << branch << " term "
+                       << term
+                       << " not found during GC scan, skipping retained-file "
+                          "augmentation for this manifest";
         }
     }
 
@@ -595,8 +616,7 @@ KvError AugmentRetainedFilesFromBranchManifests(
 
         if (is_cloud)
         {
-            err = ReadCloudFile(
-                tbl_id, filename, buf, cloud_mgr, cloud_mgr->options_);
+            err = ReadCloudFile(tbl_id, filename, buf, cloud_mgr);
         }
         else
         {
@@ -1134,7 +1154,7 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
             tbl_id, deleted_filenames, cloud_mgr, local_cleanup_targets);
         if (!local_cleanup_targets.empty())
         {
-            cloud_mgr->RequestGcLocalCleanup(tbl_id, local_cleanup_targets);
+            cloud_mgr->ScheduleLocalFileCleanup(tbl_id, local_cleanup_targets);
         }
     }
 
