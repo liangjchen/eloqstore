@@ -111,6 +111,7 @@ pub struct ScanRequest {
     begin: Vec<u8>,
     end: Vec<u8>,
     begin_inclusive: bool,
+    end_inclusive: bool,
     max_entries: usize,
     max_size: usize,
 }
@@ -122,6 +123,7 @@ impl ScanRequest {
             begin: vec![],
             end: vec![],
             begin_inclusive: true,
+            end_inclusive: false,
             max_entries: usize::MAX,
             max_size: usize::MAX,
         }
@@ -161,7 +163,7 @@ impl Request for ScanRequest {
                     self.begin_inclusive,
                     self.end.as_ptr(),
                     self.end.len(),
-                    true,
+                    self.end_inclusive,
                 );
             }
 
@@ -193,10 +195,7 @@ impl Request for ScanRequest {
                     // Save has_more before freeing the result
                     let has_more = result.has_more;
                     eloqstore_sys::CEloqStore_FreeScanResult(&mut result);
-                    ScanResponse {
-                        entries,
-                        has_more,
-                    }
+                    ScanResponse { entries, has_more }
                 }
                 _ => {
                     eloqstore_sys::CEloqStore_ScanRequest_Destroy(req);

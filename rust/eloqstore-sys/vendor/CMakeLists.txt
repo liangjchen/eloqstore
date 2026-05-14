@@ -350,7 +350,14 @@ else()
     endif()
 endif()
 
-# vendor/{src,include,external} are soft-linked to repository root, no additional configuration needed
+# Prefer the crate-local ffi/ copy so cargo package/publish works from the
+# packaged tarball. Fall back to the repository-root ffi/ during normal
+# workspace development.
+set(ROOT_FFI_DIR "${PROJECT_SOURCE_DIR}/../ffi")
+if (NOT EXISTS "${ROOT_FFI_DIR}/src/eloqstore_capi.cpp")
+    set(ROOT_FFI_DIR "${PROJECT_SOURCE_DIR}/../../../ffi")
+endif ()
+
 # Skip git submodule update for Rust FFI build - build.rs runs it from repo root
 if (NOT BUILD_FOR_RUST)
     find_package(Git QUIET)
@@ -380,7 +387,7 @@ SET(ELOQ_STORE_INCLUDE
         ${PROJECT_SOURCE_DIR}/external
         ${PROJECT_SOURCE_DIR}/external/abseil
         ${PROJECT_SOURCE_DIR}/include
-        ${PROJECT_SOURCE_DIR}/ffi/include
+        ${ROOT_FFI_DIR}/include
         ${PROJECT_SOURCE_DIR})
 
 set(ELOQ_STORE_SOURCES
@@ -392,7 +399,7 @@ set(ELOQ_STORE_SOURCES
         src/comparator.cpp
         src/compression.cpp
         src/eloq_store.cpp
-        ffi/src/eloqstore_capi.cpp
+        ${ROOT_FFI_DIR}/src/eloqstore_capi.cpp
         src/eloqstore_module.cpp
         src/file_gc.cpp
         src/kill_point.cpp

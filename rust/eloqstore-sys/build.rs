@@ -13,12 +13,22 @@ fn add_usr_local_link_search_paths_if_needed() {
             continue;
         }
         let has_glog = d.join("libglog.so").exists() || d.join("libglog.so.1").exists();
-        let has_gflags =
-            d.join("libgflags.so").exists() || d.join("libgflags.so.2").exists();
+        let has_gflags = d.join("libgflags.so").exists() || d.join("libgflags.so.2").exists();
         if has_glog || has_gflags {
             println!("cargo:rustc-link-search=native={}", d.display());
         }
     }
+}
+
+fn has_ccache() -> bool {
+    if std::env::var_os("CCACHE_DIR").is_none() {
+        return false;
+    }
+    Command::new("ccache")
+        .arg("--version")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn main() {
@@ -33,7 +43,9 @@ fn main() {
                 .status();
             if let Ok(s) = status {
                 if !s.success() {
-                    panic!("git submodule update --init --recursive failed, please manually execute in repository root");
+                    panic!(
+                        "git submodule update --init --recursive failed, please manually execute in repository root"
+                    );
                 }
             }
         }
@@ -43,12 +55,17 @@ fn main() {
     let num_jobs = std::env::var("NUM_JOBS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .or_else(|| std::thread::available_parallelism().ok().map(|p| p.get() as u32))
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .map(|p| p.get() as u32)
+        })
         .unwrap_or(1)
         .max(1);
 
     // Enable static linking of all dependencies
-    let dst = Config::new("vendor")
+    let mut config = Config::new("vendor");
+    config
         .define("CMAKE_CXX_STANDARD", "20")
         .define("BUILD_FOR_RUST", "ON")
         .define("STATIC_ALL_DEPS", "ON")
@@ -57,8 +74,15 @@ fn main() {
         .define("WITH_DB_STRESS", "OFF")
         .define("WITH_BENCHMARK", "OFF")
         .define("ELOQ_MODULE_ENABLED", "OFF")
-        .build_arg(format!("-j{}", num_jobs))
-        .build();
+        .build_arg(format!("-j{}", num_jobs));
+
+    if has_ccache() {
+        config
+            .define("CMAKE_C_COMPILER_LAUNCHER", "ccache")
+            .define("CMAKE_CXX_COMPILER_LAUNCHER", "ccache");
+    }
+
+    let dst = config.build();
 
     let build_dir = dst.join("build");
     let lib_dir = dst.join("lib");

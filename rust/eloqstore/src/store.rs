@@ -11,14 +11,13 @@ pub struct Options {
 impl Options {
     pub fn new() -> Result<Self, KvError> {
         // Ensure embedded library is available before calling FFI functions
-        eloqstore_sys::ensure_library_loaded()
-            .map_err(|e| {
-                // Convert library loading error to KvError::IoFail
-                // The error message from ensure_library_loaded contains details about
-                // why library extraction or loading failed
-                eprintln!("Failed to load embedded library: {}", e);
-                KvError::IoFail
-            })?;
+        eloqstore_sys::ensure_library_loaded().map_err(|e| {
+            // Convert library loading error to KvError::IoFail
+            // The error message from ensure_library_loaded contains details about
+            // why library extraction or loading failed
+            eprintln!("Failed to load embedded library: {}", e);
+            KvError::IoFail
+        })?;
         let ptr = unsafe { eloqstore_sys::CEloqStore_Options_Create() };
         if ptr.is_null() {
             Err(KvError::OutOfMem)
@@ -54,6 +53,17 @@ impl Options {
         Ok(())
     }
 
+    pub fn load_from_ini<P: AsRef<Path>>(&mut self, path: P) -> Result<(), KvError> {
+        let path = CString::new(path.as_ref().to_string_lossy().as_bytes())
+            .map_err(|_| KvError::InvalidArgs)?;
+        let ok = unsafe { eloqstore_sys::CEloqStore_Options_LoadFromIni(self.ptr, path.as_ptr()) };
+        if ok {
+            Ok(())
+        } else {
+            Err(KvError::InvalidArgs)
+        }
+    }
+
     pub fn set_data_append_mode(&mut self, enable: bool) {
         unsafe { eloqstore_sys::CEloqStore_Options_SetDataAppendMode(self.ptr, enable) }
     }
@@ -62,12 +72,31 @@ impl Options {
         unsafe { eloqstore_sys::CEloqStore_Options_SetEnableCompression(self.ptr, enable) }
     }
 
+    pub fn set_manifest_limit(&mut self, limit: u32) {
+        unsafe { eloqstore_sys::CEloqStore_Options_SetManifestLimit(self.ptr, limit) }
+    }
+
+    pub fn set_fd_limit(&mut self, limit: u32) {
+        unsafe { eloqstore_sys::CEloqStore_Options_SetFdLimit(self.ptr, limit) }
+    }
+
+    pub fn set_pages_per_file_shift(&mut self, shift: u8) {
+        unsafe { eloqstore_sys::CEloqStore_Options_SetPagesPerFileShift(self.ptr, shift) }
+    }
+
+    pub fn set_overflow_pointers(&mut self, n: u8) -> Result<(), KvError> {
+        if n > 128 {
+            return Err(KvError::InvalidArgs);
+        }
+        unsafe { eloqstore_sys::CEloqStore_Options_SetOverflowPointers(self.ptr, n) }
+        Ok(())
+    }
+
     pub fn set_cloud_store_path(&mut self, path: &str) -> Result<(), KvError> {
         // CString is created here and passed to C API. The C++ code copies the string
         // into a std::string, so it's safe for the CString to be dropped when this
         // method returns.
-        let path = CString::new(path)
-            .map_err(|_| KvError::InvalidArgs)?;
+        let path = CString::new(path).map_err(|_| KvError::InvalidArgs)?;
         unsafe { eloqstore_sys::CEloqStore_Options_SetCloudStorePath(self.ptr, path.as_ptr()) }
         Ok(())
     }
@@ -76,8 +105,7 @@ impl Options {
         // CString is created here and passed to C API. The C++ code copies the string
         // into a std::string, so it's safe for the CString to be dropped when this
         // method returns.
-        let provider = CString::new(provider)
-            .map_err(|_| KvError::InvalidArgs)?;
+        let provider = CString::new(provider).map_err(|_| KvError::InvalidArgs)?;
         unsafe { eloqstore_sys::CEloqStore_Options_SetCloudProvider(self.ptr, provider.as_ptr()) }
         Ok(())
     }
@@ -86,20 +114,21 @@ impl Options {
         // CString is created here and passed to C API. The C++ code copies the string
         // into a std::string, so it's safe for the CString to be dropped when this
         // method returns.
-        let region = CString::new(region)
-            .map_err(|_| KvError::InvalidArgs)?;
+        let region = CString::new(region).map_err(|_| KvError::InvalidArgs)?;
         unsafe { eloqstore_sys::CEloqStore_Options_SetCloudRegion(self.ptr, region.as_ptr()) }
         Ok(())
     }
 
-    pub fn set_cloud_credentials(&mut self, access_key: &str, secret_key: &str) -> Result<(), KvError> {
+    pub fn set_cloud_credentials(
+        &mut self,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<(), KvError> {
         // CString is created here and passed to C API. The C++ code copies the strings
         // into std::string objects, so it's safe for the CStrings to be dropped when
         // this method returns.
-        let access_key = CString::new(access_key)
-            .map_err(|_| KvError::InvalidArgs)?;
-        let secret_key = CString::new(secret_key)
-            .map_err(|_| KvError::InvalidArgs)?;
+        let access_key = CString::new(access_key).map_err(|_| KvError::InvalidArgs)?;
+        let secret_key = CString::new(secret_key).map_err(|_| KvError::InvalidArgs)?;
         unsafe {
             eloqstore_sys::CEloqStore_Options_SetCloudCredentials(
                 self.ptr,
@@ -142,8 +171,7 @@ pub struct TableIdentifier {
 
 impl TableIdentifier {
     pub fn new(name: &str, partition_id: u32) -> Result<Self, KvError> {
-        let name = CString::new(name)
-            .map_err(|_| KvError::InvalidArgs)?;
+        let name = CString::new(name).map_err(|_| KvError::InvalidArgs)?;
         let ptr =
             unsafe { eloqstore_sys::CEloqStore_TableIdent_Create(name.as_ptr(), partition_id) };
         if ptr.is_null() {
@@ -212,6 +240,27 @@ impl EloqStore {
         }
     }
 
+    pub fn start_with_branch(
+        &mut self,
+        branch: &str,
+        term: u64,
+        partition_group_id: u32,
+    ) -> Result<(), KvError> {
+        let branch = CString::new(branch).map_err(|_| KvError::InvalidArgs)?;
+        let status = unsafe {
+            eloqstore_sys::CEloqStore_StartWithBranch(
+                self.ptr,
+                branch.as_ptr(),
+                term,
+                partition_group_id,
+            )
+        };
+        match status {
+            eloqstore_sys::CEloqStoreStatus::Ok => Ok(()),
+            _ => Err(status.into()),
+        }
+    }
+
     pub fn stop(&mut self) {
         unsafe { eloqstore_sys::CEloqStore_Stop(self.ptr) }
     }
@@ -233,6 +282,23 @@ impl EloqStore {
             Ok(resp) => Ok(Some(resp.value)),
             Err(KvError::NotFound) => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+
+    pub fn exists(&self, tbl: &TableIdentifier, key: &[u8]) -> Result<bool, KvError> {
+        unsafe {
+            let mut out_exists: bool = false;
+            let status = eloqstore_sys::CEloqStore_Exists(
+                self.ptr,
+                tbl.ptr,
+                key.as_ptr(),
+                key.len(),
+                &mut out_exists,
+            );
+            match status {
+                eloqstore_sys::CEloqStoreStatus::Ok => Ok(out_exists),
+                _ => Err(status.into()),
+            }
         }
     }
 

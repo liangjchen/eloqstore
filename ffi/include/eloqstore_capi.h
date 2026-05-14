@@ -87,6 +87,7 @@ extern "C"
         uint64_t timestamp;
         uint64_t expire_ts;
         bool found;
+        bool owns_value;
     } CGetResult;
 
     // Floor operation result
@@ -160,6 +161,8 @@ extern "C"
                                                     bool enable);
     void CEloqStore_Options_SetCloudVerifySsl(CEloqStoreHandle opts,
                                               bool verify);
+    bool CEloqStore_Options_LoadFromIni(CEloqStoreHandle opts,
+                                        const char *path);
 
     bool CEloqStore_Options_Validate(CEloqStoreHandle opts);
 
@@ -171,6 +174,10 @@ extern "C"
     void CEloqStore_Destroy(CEloqStoreHandle store);
 
     CEloqStoreStatus CEloqStore_Start(CEloqStoreHandle store);
+    CEloqStoreStatus CEloqStore_StartWithBranch(CEloqStoreHandle store,
+                                                const char *branch,
+                                                uint64_t term,
+                                                uint32_t partition_group_id);
     void CEloqStore_Stop(CEloqStoreHandle store);
     bool CEloqStore_IsStopped(CEloqStoreHandle store);
 
@@ -252,6 +259,18 @@ extern "C"
                                     const uint8_t *key,
                                     size_t key_len,
                                     CGetResult *out_result);
+    CEloqStoreStatus CEloqStore_GetInto(CEloqStoreHandle store,
+                                        CTableIdentHandle table,
+                                        const uint8_t *key,
+                                        size_t key_len,
+                                        uint8_t *out_value,
+                                        size_t out_capacity,
+                                        CGetResult *out_result);
+    CEloqStoreStatus CEloqStore_Exists(CEloqStoreHandle store,
+                                       CTableIdentHandle table,
+                                       const uint8_t *key,
+                                       size_t key_len,
+                                       bool *out_exists);
 
     CEloqStoreStatus CEloqStore_Floor(CEloqStoreHandle store,
                                       CTableIdentHandle table,

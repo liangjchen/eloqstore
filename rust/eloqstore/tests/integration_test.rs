@@ -1,4 +1,7 @@
 use eloqstore::{EloqStore, Options, ReadRequest, ScanRequest, TableIdentifier, WriteRequest};
+use eloqstore_sys;
+use std::fs;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn timestamp() -> u64 {
@@ -8,6 +11,12 @@ fn timestamp() -> u64 {
         .as_millis() as u64
 }
 
+fn temp_path(prefix: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("{}-{}", prefix, timestamp()));
+    path
+}
+
 #[test]
 fn test_all_apis() {
     println!("\nEloqStore Rust FFI Demo");
@@ -15,7 +24,6 @@ fn test_all_apis() {
 
     let mut opts = Options::new().expect("Failed to create options");
     opts.set_num_threads(1).expect("Failed to set num threads");
-    opts.add_store_path("tmp/eloqstore_demo").expect("Failed to add store path");
     let mut store = EloqStore::new(&opts).expect("Failed to create store");
     store.start().expect("Failed to start store");
 
@@ -32,11 +40,15 @@ fn test_all_apis() {
     store.put(&table, key, value, ts).expect("PUT");
     println!("✓ put(key={:?}, value={:?})", key, value);
 
+    assert!(store.exists(&table, key).expect("exists"));
+    println!("✓ exists(key={:?}) -> true", key);
+
     let v = store.get(&table, key).expect("GET").expect("not found");
     assert_eq!(v, value);
     println!("✓ get(key={:?}) -> {:?}", key, String::from_utf8_lossy(&v));
 
     store.delete(&table, key, ts + 1).expect("DELETE");
+    assert!(!store.exists(&table, key).expect("exists"));
     assert!(store.get(&table, key).expect("GET after DELETE").is_none());
     println!("✓ delete(key={:?})", key);
 
@@ -158,4 +170,171 @@ fn test_all_apis() {
     println!("  - Floor: floor() for range queries");
     println!("  - Request Trait: ReadRequest, WriteRequest with exec_sync()");
     println!("  - Paginated Scan: ScanRequest with pagination support");
+}
+
+#[test]
+fn test_start_with_branch_api() {
+    let mut opts = Options::new().expect("Failed to create options");
+    opts.set_num_threads(1).expect("Failed to set num threads");
+
+    let mut store = EloqStore::new(&opts).expect("Failed to create store");
+    store
+        .start_with_branch("feature-x", 7, 3)
+        .expect("Failed to start with branch");
+
+    let table = TableIdentifier::new("branch_table", 0).expect("Failed to create table");
+    let ts = timestamp();
+    store.put(&table, b"hello", b"world", ts).expect("PUT");
+    assert_eq!(
+        store.get(&table, b"hello").expect("GET"),
+        Some(b"world".to_vec())
+    );
+    store.stop();
+}
+
+#[test]
+fn test_load_from_ini_and_disk_persistence() {
+    let root = temp_path("eloqstore-rust-ini");
+    let store_path = root.join("data");
+    fs::create_dir_all(&store_path).expect("Failed to create store path");
+
+    let ini_path = root.join("eloqstore.ini");
+    fs::write(
+        &ini_path,
+        "[run]\nnum_threads = 1\nbuffer_pool_size = 4MB\n\n[permanent]\ndata_page_size = 4KB\n",
+    )
+    .expect("Failed to write ini file");
+
+    let table = TableIdentifier::new("disk_table", 0).expect("Failed to create table");
+    let ts = timestamp();
+
+    let mut opts = Options::new().expect("Failed to create options");
+    opts.load_from_ini(&ini_path).expect("Failed to load ini");
+    opts.add_store_path(&store_path)
+        .expect("Failed to add store path");
+
+    let mut store = EloqStore::new(&opts).expect("Failed to create store");
+    store.start().expect("Failed to start store");
+    store.put(&table, b"persist", b"value", ts).expect("PUT");
+    store.stop();
+
+    let mut reopened_opts = Options::new().expect("Failed to create options");
+    reopened_opts
+        .load_from_ini(&ini_path)
+        .expect("Failed to load ini");
+    reopened_opts
+        .add_store_path(&store_path)
+        .expect("Failed to add store path");
+
+    let mut reopened = EloqStore::new(&reopened_opts).expect("Failed to create reopened store");
+    reopened.start().expect("Failed to restart store");
+    assert!(reopened.exists(&table, b"persist").expect("exists"));
+    assert_eq!(
+        reopened.get(&table, b"persist").expect("GET"),
+        Some(b"value".to_vec())
+    );
+    reopened.stop();
+}
+
+#[test]
+fn test_c_scan_range_honors_end_inclusive() {
+    eloqstore_sys::ensure_library_loaded().expect("Failed to load embedded library");
+
+    unsafe {
+        let opts = eloqstore_sys::CEloqStore_Options_Create();
+        assert!(!opts.is_null(), "Failed to create options");
+        eloqstore_sys::CEloqStore_Options_SetNumThreads(opts, 1);
+
+        let store = eloqstore_sys::CEloqStore_Create(opts);
+        assert!(!store.is_null(), "Failed to create store");
+        assert_eq!(
+            eloqstore_sys::CEloqStore_Start(store),
+            eloqstore_sys::CEloqStoreStatus::Ok
+        );
+
+        let table_name = std::ffi::CString::new("scan_range_table").unwrap();
+        let table = eloqstore_sys::CEloqStore_TableIdent_Create(table_name.as_ptr(), 0);
+        assert!(!table.is_null(), "Failed to create table");
+
+        let ts = timestamp();
+        for key in [
+            b"apple".as_slice(),
+            b"banana".as_slice(),
+            b"cherry".as_slice(),
+        ] {
+            assert_eq!(
+                eloqstore_sys::CEloqStore_Put(
+                    store,
+                    table,
+                    key.as_ptr(),
+                    key.len(),
+                    key.as_ptr(),
+                    key.len(),
+                    ts,
+                ),
+                eloqstore_sys::CEloqStoreStatus::Ok
+            );
+        }
+
+        let mut scan_req = eloqstore_sys::CEloqStore_ScanRequest_Create();
+        assert!(!scan_req.is_null(), "Failed to create scan request");
+        eloqstore_sys::CEloqStore_ScanRequest_SetTable(scan_req, table);
+        eloqstore_sys::CEloqStore_ScanRequest_SetRange(
+            scan_req,
+            b"banana".as_ptr(),
+            b"banana".len(),
+            true,
+            b"cherry".as_ptr(),
+            b"cherry".len(),
+            false,
+        );
+        let mut scan_result: eloqstore_sys::CScanResult = std::mem::zeroed();
+        assert_eq!(
+            eloqstore_sys::CEloqStore_ExecScan(store, scan_req, &mut scan_result),
+            eloqstore_sys::CEloqStoreStatus::Ok
+        );
+        assert_eq!(scan_result.num_entries, 1);
+        assert!(!scan_result.entries.is_null());
+        let first = *scan_result.entries;
+        assert_eq!(
+            std::slice::from_raw_parts(first.key, first.key_len),
+            b"banana"
+        );
+        eloqstore_sys::CEloqStore_FreeScanResult(&mut scan_result);
+        eloqstore_sys::CEloqStore_ScanRequest_Destroy(scan_req);
+
+        scan_req = eloqstore_sys::CEloqStore_ScanRequest_Create();
+        assert!(!scan_req.is_null(), "Failed to create scan request");
+        eloqstore_sys::CEloqStore_ScanRequest_SetTable(scan_req, table);
+        eloqstore_sys::CEloqStore_ScanRequest_SetRange(
+            scan_req,
+            b"banana".as_ptr(),
+            b"banana".len(),
+            true,
+            b"cherry".as_ptr(),
+            b"cherry".len(),
+            true,
+        );
+        let mut inclusive_result: eloqstore_sys::CScanResult = std::mem::zeroed();
+        assert_eq!(
+            eloqstore_sys::CEloqStore_ExecScan(store, scan_req, &mut inclusive_result),
+            eloqstore_sys::CEloqStoreStatus::Ok
+        );
+        assert_eq!(inclusive_result.num_entries, 2);
+        assert!(!inclusive_result.entries.is_null());
+        let keys: Vec<Vec<u8>> = (0..inclusive_result.num_entries)
+            .map(|i| {
+                let entry = *inclusive_result.entries.add(i);
+                std::slice::from_raw_parts(entry.key, entry.key_len).to_vec()
+            })
+            .collect();
+        assert_eq!(keys, vec![b"banana".to_vec(), b"cherry".to_vec()]);
+        eloqstore_sys::CEloqStore_FreeScanResult(&mut inclusive_result);
+        eloqstore_sys::CEloqStore_ScanRequest_Destroy(scan_req);
+
+        eloqstore_sys::CEloqStore_Stop(store);
+        eloqstore_sys::CEloqStore_TableIdent_Destroy(table);
+        eloqstore_sys::CEloqStore_Destroy(store);
+        eloqstore_sys::CEloqStore_Options_Destroy(opts);
+    }
 }
