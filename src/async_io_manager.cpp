@@ -5345,6 +5345,79 @@ KvError CloudStoreMgr::CleanManifest(const TableIdent &tbl_id)
     return KvError::NoError;
 }
 
+KvError IouringMgr::DropManifest(const TableIdent &tbl_id)
+{
+    // Unlike CleanManifest, we do NOT check HasOtherFile — data files are
+    // expected to still be present; GC will clean them later.
+    uint64_t process_term = ProcessTerm();
+    auto [dir_fd, dir_err] =
+        OpenFD(tbl_id, LruFD::kDirectory, false, "", 0);
+    if (dir_err == KvError::NoError)
+    {
+        const std::string manifest_name =
+            BranchManifestFileName(GetActiveBranch(), process_term);
+        int res = UnlinkAt(dir_fd.FdPair(), manifest_name.c_str(), false);
+        if (res < 0 && res != -ENOENT)
+        {
+            LOG(ERROR) << "DropManifest: failed to unlink manifest for "
+                       << tbl_id.ToString() << ": " << strerror(-res);
+        }
+        KvError close_err = CloseFile(std::move(dir_fd));
+        if (close_err != KvError::NoError)
+        {
+            LOG(WARNING) << "DropManifest: failed to close dir for "
+                         << tbl_id.ToString() << ": "
+                         << ErrorString(close_err);
+        }
+    }
+    else if (dir_err != KvError::NotFound)
+    {
+        LOG(WARNING) << "DropManifest: failed to open dir for "
+                     << tbl_id.ToString() << ": " << ErrorString(dir_err);
+    }
+    return KvError::NoError;
+}
+
+KvError CloudStoreMgr::DropManifest(const TableIdent &tbl_id)
+{
+    // 1. Delete local manifest file.
+    KvError err = IouringMgr::DropManifest(tbl_id);
+    if (err != KvError::NoError)
+    {
+        return err;
+    }
+
+    const std::string manifest_name =
+        BranchManifestFileName(GetActiveBranch(), ProcessTerm());
+
+    // 2. Remove from FileCleaner's closed-file tracking.
+    if (DequeClosedFile(FileKey(tbl_id, manifest_name)))
+    {
+        const size_t manifest_size = options_->manifest_limit;
+        used_local_space_ = used_local_space_ > manifest_size
+                                ? used_local_space_ - manifest_size
+                                : 0;
+    }
+
+    // 3. Delete the manifest from cloud object storage.
+    std::string remote_path = tbl_id.ToString() + "/" + manifest_name;
+    KvTask *current_task = ThdTask();
+    ObjectStore::DeleteTask delete_task(remote_path);
+    delete_task.SetKvTask(current_task);
+    AcquireCloudSlot(current_task);
+    GetObjectStore().SubmitTask(&delete_task, shard);
+    current_task->WaitIo();
+    if (delete_task.error_ != KvError::NoError &&
+        delete_task.error_ != KvError::NotFound)
+    {
+        LOG(WARNING) << "DropManifest: failed to delete cloud manifest "
+                     << remote_path << ": "
+                     << ErrorString(delete_task.error_);
+    }
+
+    return KvError::NoError;
+}
+
 KvError CloudStoreMgr::CreateArchive(const TableIdent &tbl_id,
                                      std::string_view branch_name,
                                      uint64_t term,
@@ -7212,6 +7285,11 @@ KvError MemStoreMgr::AbortWrite(const TableIdent &tbl_id)
 }
 
 KvError MemStoreMgr::CleanManifest(const TableIdent &tbl_id)
+{
+    return KvError::NoError;
+}
+
+KvError MemStoreMgr::DropManifest(const TableIdent &tbl_id)
 {
     return KvError::NoError;
 }

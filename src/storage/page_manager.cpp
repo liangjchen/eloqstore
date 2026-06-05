@@ -547,7 +547,33 @@ KvError PageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
         {
             LOG(INFO) << "InstallExternalSnapshot missing remote state for "
                       << "table " << tbl_ident << ", tag " << reopen_tag;
-            return InstallEmptySnapshot(tbl_ident, cow_meta);
+
+            // Delete any stale local manifest and clear in-memory state.
+            KvError drop_err = IoMgr()->DropManifest(tbl_ident);
+            if (drop_err != KvError::NoError)
+            {
+                LOG(WARNING) << "InstallExternalSnapshot DropManifest failed "
+                             << "for table " << tbl_ident
+                             << ", error " << static_cast<uint32_t>(drop_err);
+            }
+
+            auto [entry, inserted] = RootMetaManager()->GetOrCreate(tbl_ident);
+            static_cast<void>(inserted);
+            RootMeta &meta = entry->meta_;
+            meta.root_id_ = MaxPageId;
+            meta.ttl_root_id_ = MaxPageId;
+            meta.manifest_size_ = 0;
+            meta.next_expire_ts_ = 0;
+            meta.mapper_.reset();
+            meta.mapping_snapshots_.clear();
+            meta.compression_.reset();
+            RootMetaManager()->UpdateBytes(entry, 0);
+
+            cow_meta = CowRootMeta();
+            cow_meta.root_id_ = MaxPageId;
+            cow_meta.ttl_root_id_ = MaxPageId;
+            cow_meta.manifest_size_ = 0;
+            return KvError::NoError;
         }
         LOG(ERROR) << "InstallExternalSnapshot RefreshManifest failed, table "
                    << tbl_ident << ", mode " << static_cast<int>(mode)

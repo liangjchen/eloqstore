@@ -45,6 +45,7 @@ enum class RequestType : uint8_t
     BatchWrite,
     Reopen,
     Truncate,
+    Drop,
     DropTable,
     Archive,
     Compact,
@@ -78,6 +79,8 @@ inline const char *RequestTypeToString(RequestType type)
         return "reopen";
     case RequestType::Truncate:
         return "truncate";
+    case RequestType::Drop:
+        return "drop";
     case RequestType::DropTable:
         return "drop_table";
     case RequestType::Archive:
@@ -512,6 +515,16 @@ private:
     std::string position_storage_;
 };
 
+class DropRequest : public WriteRequest
+{
+public:
+    RequestType Type() const override
+    {
+        return RequestType::Drop;
+    }
+    void SetArgs(TableIdent tid);
+};
+
 class DropTableRequest : public KvRequest
 {
 public:
@@ -524,7 +537,7 @@ public:
 
 private:
     std::string table_name_;
-    std::vector<std::unique_ptr<TruncateRequest>> truncate_reqs_;
+    std::vector<std::unique_ptr<DropRequest>> drop_reqs_;
     std::atomic<uint32_t> pending_{0};
     std::atomic<uint8_t> first_error_{static_cast<uint8_t>(KvError::NoError)};
 

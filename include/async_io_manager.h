@@ -404,6 +404,16 @@ public:
     }
 
     virtual KvError CleanManifest(const TableIdent &tbl_id) = 0;
+
+    /**
+     * @brief Drop a partition's manifest — delete it from local disk (and cloud
+     *        storage in cloud mode).  Unlike CleanManifest, this does NOT check
+     *        HasOtherFile, because it is called from Drop / Reopen-clean paths
+     *        where data files are expected to still be present and will be
+     *        cleaned by GC later.
+     */
+    virtual KvError DropManifest(const TableIdent &tbl_id) = 0;
+
     virtual void RegisterDirBusy(const TableIdent &tbl_id)
     {
         (void) tbl_id;
@@ -657,6 +667,7 @@ public:
     // overrides this to coordinate with its tracked-file state.
     virtual KvError CleanupLocalPartitionFiles(const TableIdent &tbl_id);
     KvError CleanManifest(const TableIdent &tbl_id) override;
+    KvError DropManifest(const TableIdent &tbl_id) override;
 
     static constexpr uint64_t oflags_dir = O_DIRECTORY | O_RDONLY;
 
@@ -1155,6 +1166,7 @@ public:
                               uint64_t term) override;
     KvError AbortWrite(const TableIdent &tbl_id) override;
     KvError CleanManifest(const TableIdent &tbl_id) override;
+    KvError DropManifest(const TableIdent &tbl_id) override;
 
     ObjectStore &GetObjectStore()
     {
@@ -1612,6 +1624,7 @@ public:
     }
 
     KvError CleanManifest(const TableIdent &tbl_id) override;
+    KvError DropManifest(const TableIdent &tbl_id) override;
 
     class Manifest : public ManifestFile
     {

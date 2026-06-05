@@ -335,44 +335,14 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
 
     if (data_files.empty() && archive_files.empty())
     {
-        const StoreMode mode = eloq_store->Mode();
-        if (mode == StoreMode::Cloud)
+        // No data or archive files remain.  Try to remove the partition
+        // directory if it is empty.  We do NOT touch the manifest here —
+        // manifest lifecycle is managed explicitly by DropManifest / Reopen.
+        err = io_mgr->TryCleanupLocalPartitionDir(tbl_id);
+        if (err != KvError::NoError)
         {
-            auto *cloud_mgr = static_cast<CloudStoreMgr *>(io_mgr);
-            err = cloud_mgr->CleanupLocalPartitionFiles(tbl_id);
-            if (err != KvError::NoError)
-            {
-                LOG(ERROR)
-                    << "ExecuteLocalGC: CleanupLocalPartitionFiles failed, "
-                    << "error=" << static_cast<int>(err);
-                return err;
-            }
-        }
-        else
-        {
-            err = io_mgr->CleanManifest(tbl_id);
-            if (err != KvError::NoError)
-            {
-                LOG(ERROR) << "ExecuteLocalGC: CleanManifest failed, error="
-                           << static_cast<int>(err);
-                return err;
-            }
-
-            CHECK(shard != nullptr);
-            RootMetaMgr *root_meta_mgr =
-                shard->IndexManager()->RootMetaManager();
-            auto *entry = root_meta_mgr->Find(tbl_id);
-            if (entry != nullptr)
-            {
-                RootMeta &meta = entry->meta_;
-                if (meta.mapper_ != nullptr && meta.manifest_size_ != 0 &&
-                    meta.root_id_ == MaxPageId &&
-                    meta.ttl_root_id_ == MaxPageId &&
-                    meta.mapper_->MappingCount() == 0)
-                {
-                    meta.manifest_size_ = 0;
-                }
-            }
+            LOG(WARNING) << "ExecuteLocalGC: TryCleanupLocalPartitionDir "
+                         << "failed, error=" << static_cast<int>(err);
         }
     }
 

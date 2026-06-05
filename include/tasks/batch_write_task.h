@@ -30,6 +30,8 @@ public:
 
     KvError CleanExpiredKeys();
 
+    KvError Drop();
+
 private:
     KvError ApplyBatch(PageId &root_id, bool update_ttl, uint64_t now_ts = 0);
     KvError ApplyTTLBatch();

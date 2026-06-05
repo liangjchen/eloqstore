@@ -1221,7 +1221,7 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
     req->first_error_.store(static_cast<uint8_t>(KvError::NoError),
                             std::memory_order_relaxed);
     req->pending_.store(0, std::memory_order_relaxed);
-    req->truncate_reqs_.clear();
+    req->drop_reqs_.clear();
 
     std::vector<TableIdent> partitions;
     KvError err = CollectTablePartitions(req->TableName(), partitions);
@@ -1237,15 +1237,15 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
         return;
     }
 
-    req->truncate_reqs_.reserve(partitions.size());
+    req->drop_reqs_.reserve(partitions.size());
     req->pending_.store(static_cast<uint32_t>(partitions.size()),
                         std::memory_order_relaxed);
 
     for (const TableIdent &partition : partitions)
     {
-        auto trunc_req = std::make_unique<TruncateRequest>();
-        trunc_req->SetArgs(partition, std::string_view{});
-        req->truncate_reqs_.push_back(std::move(trunc_req));
+        auto drop_req = std::make_unique<DropRequest>();
+        drop_req->SetArgs(partition);
+        req->drop_reqs_.push_back(std::move(drop_req));
     }
 
     struct DropTableScheduleState
@@ -1256,7 +1256,7 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
         size_t total = 0;
         std::atomic<size_t> next_index{0};
 
-        bool HandleTruncateResult(KvError sub_err)
+        bool HandleDropResult(KvError sub_err)
         {
             if (sub_err != KvError::NoError)
             {
@@ -1278,9 +1278,9 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
             return false;
         }
 
-        void OnTruncateDone(KvRequest *sub_req)
+        void OnDropDone(KvRequest *sub_req)
         {
-            if (HandleTruncateResult(sub_req->Error()))
+            if (HandleDropResult(sub_req->Error()))
             {
                 return;
             }
@@ -1297,20 +1297,20 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
                     return;
                 }
 
-                TruncateRequest *ptr = req->truncate_reqs_[idx].get();
+                DropRequest *ptr = req->drop_reqs_[idx].get();
                 auto self = shared_from_this();
-                auto on_truncate_done = [self](KvRequest *sub_req)
-                { self->OnTruncateDone(sub_req); };
-                if (store->ExecAsyn(ptr, 0, on_truncate_done))
+                auto on_drop_done = [self](KvRequest *sub_req)
+                { self->OnDropDone(sub_req); };
+                if (store->ExecAsyn(ptr, 0, on_drop_done))
                 {
                     return;
                 }
 
-                LOG(ERROR) << "Handle droptable request, enqueue truncate "
+                LOG(ERROR) << "Handle droptable request, enqueue drop "
                               "request fail";
                 ptr->callback_ = nullptr;
                 ptr->SetDone(KvError::NotRunning);
-                if (HandleTruncateResult(KvError::NotRunning))
+                if (HandleDropResult(KvError::NotRunning))
                 {
                     return;
                 }
@@ -1321,7 +1321,7 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
     auto state = std::make_shared<DropTableScheduleState>();
     state->store = this;
     state->req = req;
-    state->total = req->truncate_reqs_.size();
+    state->total = req->drop_reqs_.size();
 
     size_t max_inflight =
         std::max<uint32_t>(options_.max_global_request_batch, 1);
@@ -2624,6 +2624,11 @@ void TruncateRequest::SetArgs(TableIdent tbl_id, std::string position)
     position_ = position_storage_;
 }
 
+void DropRequest::SetArgs(TableIdent tbl_id)
+{
+    SetTableId(std::move(tbl_id));
+}
+
 void ArchiveRequest::SetSnapshotTimestamp(uint64_t ts)
 {
     LOG_FIRST_N(WARNING, 1)
@@ -2658,7 +2663,7 @@ void DropTableRequest::SetArgs(std::string table_name)
         SetTableId({});
     }
     table_name_ = std::move(table_name);
-    truncate_reqs_.clear();
+    drop_reqs_.clear();
     pending_.store(0, std::memory_order_relaxed);
     first_error_.store(static_cast<uint8_t>(KvError::NoError),
                        std::memory_order_relaxed);

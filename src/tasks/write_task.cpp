@@ -32,6 +32,13 @@ KvError BuildRetainedFiles(const TableIdent &tbl_id,
                            bool is_segment)
 {
     auto [root_handle, err] = shard->IndexManager()->FindRoot(tbl_id);
+    if (err == KvError::NotFound)
+    {
+        // Partition has no valid RootMeta (e.g. after Drop cleared it, or
+        // manifest was deleted).  There are no retained files.
+        retained_files.clear();
+        return KvError::NoError;
+    }
     CHECK_KV_ERR(err);
     RootMeta *meta = root_handle.Get();
     const auto &snapshots = is_segment ? meta->segment_mapping_snapshots_

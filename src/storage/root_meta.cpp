@@ -215,6 +215,7 @@ RootMetaMgr::RootMetaMgr(PageManager *owner, const KvOptions *options)
 std::pair<RootMetaMgr::Entry *, bool> RootMetaMgr::GetOrCreate(
     const TableIdent &tbl_id)
 {
+    ProcessPendingErase();
     auto [it, inserted] = entries_.try_emplace(tbl_id);
     Entry *entry = &it->second;
     if (inserted)
@@ -230,6 +231,7 @@ std::pair<RootMetaMgr::Entry *, bool> RootMetaMgr::GetOrCreate(
 
 RootMetaMgr::Entry *RootMetaMgr::Find(const TableIdent &tbl_id)
 {
+    ProcessPendingErase();
     auto it = entries_.find(tbl_id);
     if (it == entries_.end())
     {
@@ -264,6 +266,12 @@ void RootMetaMgr::Pin(Entry *entry)
     entry->meta_.ref_cnt_++;
 }
 
+static bool IsMetaEmpty(const RootMeta &meta)
+{
+    return meta.root_id_ == MaxPageId && meta.ttl_root_id_ == MaxPageId &&
+           meta.mapper_ == nullptr && meta.manifest_size_ == 0;
+}
+
 void RootMetaMgr::Unpin(Entry *entry)
 {
     assert(entry->meta_.ref_cnt_ > 0);
@@ -271,7 +279,24 @@ void RootMetaMgr::Unpin(Entry *entry)
     if (entry->meta_.ref_cnt_ == 0)
     {
         EnqueueFront(entry);
+        if (IsMetaEmpty(entry->meta_))
+        {
+            pending_erase_.push_back(entry->tbl_id_);
+        }
     }
+}
+
+void RootMetaMgr::ProcessPendingErase()
+{
+    if (pending_erase_.empty())
+    {
+        return;
+    }
+    for (const TableIdent &tbl_id : pending_erase_)
+    {
+        Erase(tbl_id);
+    }
+    pending_erase_.clear();
 }
 
 void RootMetaMgr::UpdateBytes(Entry *entry, size_t bytes)
