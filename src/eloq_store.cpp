@@ -4,7 +4,6 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -751,26 +750,69 @@ KvError EloqStore::Start(std::string_view branch,
     partition_group_id_ = mode == StoreMode::Cloud ? partition_group_id : 0;
     branch_ = std::string(branch);
 
-    // There are files opened at very early stage like stdin/stdout/stderr, glog
-    // file, and root directories of data.
+    // EloqStore runs as a library and shares the process fd table with the
+    // embedding application. Treat fd_limit as the store's desired fd slot
+    // budget, then clamp it to the process fd headroom.
     uint32_t shard_fd_limit = 0;
     size_t used_fd = utils::CountUsedFD();
-    if (used_fd + num_reserved_fd < options_.fd_limit)
+
+    uint64_t available_fd = std::numeric_limits<uint64_t>::max();
+    struct rlimit fd_rlimit;
+    if (getrlimit(RLIMIT_NOFILE, &fd_rlimit) == 0)
     {
-        shard_fd_limit = (options_.fd_limit - used_fd - num_reserved_fd) /
-                         options_.num_threads;
+        if (fd_rlimit.rlim_cur != RLIM_INFINITY)
+        {
+            uint64_t process_fd_limit =
+                static_cast<uint64_t>(fd_rlimit.rlim_cur);
+            if (process_fd_limit > used_fd + num_reserved_fd)
+            {
+                available_fd = process_fd_limit - used_fd - num_reserved_fd;
+            }
+            else
+            {
+                available_fd = 0;
+            }
+        }
     }
-    if (shard_fd_limit == 0)
+    else
     {
-        LOG(ERROR) << "EloqStore::Start cannot proceed: shard_fd_limit is 0. "
-                   << "fd_limit=" << options_.fd_limit
+        LOG(WARNING) << "Failed to get RLIMIT_NOFILE: "
+                     << std::strerror(errno)
+                     << ", using configured fd_limit without process clamp";
+    }
+
+    uint64_t store_fd_limit =
+        std::min<uint64_t>(options_.fd_limit, available_fd);
+    if (store_fd_limit < options_.fd_limit)
+    {
+        LOG(WARNING) << "Clamp store fd limit from " << options_.fd_limit
+                     << " to " << store_fd_limit
+                     << ", used_fd=" << used_fd
+                     << ", reserved_fd=" << num_reserved_fd;
+    }
+
+    if (!options_.store_path.empty() && store_fd_limit < options_.num_threads)
+    {
+        LOG(ERROR) << "Insufficient fd budget for EloqStore: fd_limit="
+                   << options_.fd_limit << ", available_fd=" << available_fd
                    << ", used_fd=" << used_fd
-                   << ", num_reserved_fd=" << num_reserved_fd
-                   << ", num_threads=" << options_.num_threads
-                   << ". Raise fd_limit so that (fd_limit - used_fd - "
-                      "num_reserved_fd) / num_threads >= 1.";
+                   << ", reserved_fd=" << num_reserved_fd
+                   << ", num_threads=" << options_.num_threads;
         return fail_start(KvError::OpenFileLimit);
     }
+
+    if (options_.num_threads > 0)
+    {
+        shard_fd_limit =
+            static_cast<uint32_t>(store_fd_limit / options_.num_threads);
+    }
+    LOG(INFO) << "Calculate shard fd limit: fd_limit=" << options_.fd_limit
+              << ", used_fd=" << used_fd
+              << ", reserved_fd=" << num_reserved_fd
+              << ", available_fd=" << available_fd
+              << ", store_fd_limit=" << store_fd_limit
+              << ", num_threads=" << options_.num_threads
+              << ", shard_fd_limit=" << shard_fd_limit;
 
     shards_.resize(options_.num_threads);
     for (size_t i = 0; i < options_.num_threads; i++)

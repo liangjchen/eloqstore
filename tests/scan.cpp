@@ -29,7 +29,7 @@ TEST_CASE("scan nonexistent partition", "[scan]")
     scan_req.SetArgs(tbl_id, start_key, end_key);
 
     store.ExecSync(&scan_req);
-    REQUIRE(scan_req.Error() == eloqstore::KvError::NoError);
+    REQUIRE(scan_req.Error() == eloqstore::KvError::NotFound);
 
     store.Stop();
 
