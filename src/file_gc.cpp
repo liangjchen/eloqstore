@@ -96,6 +96,46 @@ namespace FileGarbageCollector
 
 namespace
 {
+// For the local active branch, derive the in-flight boundary from the
+// in-memory RootMeta. The boundary is RootMeta::first_unflushed_*_fp_id_,
+// which is the FilePageAllocator's MaxFilePageId() at the moment of the
+// last successful manifest flush -- i.e., the smallest file page id whose
+// allocation was not yet captured by any disk manifest. Converting from
+// page-id space to file-id space yields
+// BranchGuard::least_unflushed_*_file_id_.
+//
+// The on-disk manifest pass that runs after this composes via std::max,
+// so if a non-active branch's disk manifest reaches further, it still
+// wins. retained_files is left entirely to the disk-manifest pass; the
+// in-flight guard alone covers everything past the flushed boundary.
+void SeedActiveBranchGuardFromInMemory(const TableIdent &tbl_id,
+                                       std::string_view active_branch,
+                                       uint64_t process_term,
+                                       uint8_t pages_per_file_shift,
+                                       uint8_t segments_per_file_shift,
+                                       BranchGuardMap &branch_guards)
+{
+    BranchGuard guard{process_term, 0, 0};
+
+    if (shard != nullptr)
+    {
+        RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
+        RootMetaMgr::Entry *entry = root_meta_mgr->Find(tbl_id);
+        if (entry != nullptr)
+        {
+            // No yields between Find() and the field reads below, so the
+            // entry cannot be evicted out from under us; no Handle pin needed.
+            const RootMeta &meta = entry->meta_;
+            guard.least_unflushed_file_id_ =
+                meta.first_unflushed_fp_id_ >> pages_per_file_shift;
+            guard.least_unflushed_seg_file_id_ =
+                meta.first_unflushed_seg_fp_id_ >> segments_per_file_shift;
+        }
+    }
+
+    branch_guards.emplace(std::string(active_branch), guard);
+}
+
 bool ParseCloudCleanupFilename(std::string_view filename,
                                FileId &file_id,
                                uint64_t &term)
@@ -209,13 +249,19 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
     // No need to check term expired for local mode.
 
     // 2a. augment retained_files / retained_segment_files from all branch
-    // manifests (regular + archive) on disk and build branch_guards. Pre-
-    // seed the local active branch at the current process_term so files
-    // written before the first manifest flush at this term are still
-    // protected by the in-flight guard.
+    // manifests (regular + archive) on disk and build branch_guards. For
+    // the local active branch the in-memory RootMeta tracks the boundary
+    // of the flushed region (RootMeta::first_unflushed_*_fp_id_) more
+    // currently than any disk manifest does, so we seed the active branch
+    // guard from there. The disk-manifest pass then composes via std::max
+    // so non-active branches that only live on disk are covered.
     BranchGuardMap branch_guards;
-    branch_guards.emplace(std::string(io_mgr->GetActiveBranch()),
-                          BranchGuard{io_mgr->ProcessTerm(), 0, 0});
+    SeedActiveBranchGuardFromInMemory(tbl_id,
+                                      io_mgr->GetActiveBranch(),
+                                      io_mgr->ProcessTerm(),
+                                      io_mgr->options_->pages_per_file_shift,
+                                      io_mgr->options_->segments_per_file_shift,
+                                      branch_guards);
     err = AugmentRetainedFilesFromBranchManifests(
         tbl_id,
         manifest_branch_names,
@@ -342,9 +388,22 @@ KvError ListLocalFiles(const TableIdent &tbl_id,
     fs::path dir_path = tbl_id.StorePath(io_mgr->options_->store_path,
                                          io_mgr->options_->store_path_lut);
 
-    for (auto &ent : fs::directory_iterator{dir_path})
+    // The partition directory may be removed concurrently (e.g. partition
+    // cleanup after a drop). Treat that as "nothing to list" rather than
+    // letting the throwing iterator abort the process.
+    std::error_code ec;
+    fs::directory_iterator it{dir_path, ec};
+    if (ec)
     {
-        const std::string name = ent.path().filename();
+        return KvError::NoError;
+    }
+    for (; it != fs::directory_iterator{}; it.increment(ec))
+    {
+        if (ec)
+        {
+            return KvError::NoError;
+        }
+        const std::string name = it->path().filename();
         if (boost::algorithm::ends_with(name, TmpSuffix))
         {
             // Skip temporary files.
@@ -553,6 +612,11 @@ static KvError ProcessOneManifest(
     // same branch are by definition already complete.
     for (const BranchFileRange &range : replayer.branch_metadata_.file_ranges)
     {
+        // range.max_file_id_ is the highest file_id reached at flush time
+        // (inclusive). Under "least_unflushed" semantics, the file at that id
+        // may still be partially flushed, so it itself is protected. The
+        // numeric value is the same; only the >= comparison in the retention
+        // check differs from a strict `>` against the legacy "max" field.
         auto [it, inserted] = branch_guards.try_emplace(
             range.branch_name_,
             BranchGuard{
@@ -565,15 +629,15 @@ static KvError ProcessOneManifest(
         if (range.term_ > g.newest_term_)
         {
             g.newest_term_ = range.term_;
-            g.max_data_file_id_ = range.max_file_id_;
-            g.max_segment_file_id_ = range.max_segment_file_id_;
+            g.least_unflushed_file_id_ = range.max_file_id_;
+            g.least_unflushed_seg_file_id_ = range.max_segment_file_id_;
         }
         else if (range.term_ == g.newest_term_)
         {
-            g.max_data_file_id_ =
-                std::max(g.max_data_file_id_, range.max_file_id_);
-            g.max_segment_file_id_ =
-                std::max(g.max_segment_file_id_, range.max_segment_file_id_);
+            g.least_unflushed_file_id_ =
+                std::max(g.least_unflushed_file_id_, range.max_file_id_);
+            g.least_unflushed_seg_file_id_ = std::max(
+                g.least_unflushed_seg_file_id_, range.max_segment_file_id_);
         }
         // term < newest_term_: ignore (historical or cross-branch reference).
     }
@@ -882,11 +946,11 @@ KvError DeleteUnreferencedCloudFiles(
         // known term.
         auto it = branch_guards.find(branch_name);
         if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id > it->second.max_data_file_id_)
+            file_id >= it->second.least_unflushed_file_id_)
         {
             DLOG(INFO) << "skip file " << file_name << " (file_id=" << file_id
-                       << " > max=" << it->second.max_data_file_id_
-                       << ", in-flight)";
+                       << " >= least_unflushed="
+                       << it->second.least_unflushed_file_id_ << ", in-flight)";
             continue;
         }
 
@@ -1070,12 +1134,11 @@ KvError DeleteUnreferencedLocalFiles(
         // the same branch are by definition already complete.
         auto it = branch_guards.find(branch_name);
         if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id > it->second.max_data_file_id_)
+            file_id >= it->second.least_unflushed_file_id_)
         {
             DLOG(INFO) << "ExecuteLocalGC: keep file " << file_name
-                       << " (file_id=" << file_id
-                       << " > max=" << it->second.max_data_file_id_
-                       << ", in-flight)";
+                       << " (file_id=" << file_id << " >= least_unflushed="
+                       << it->second.least_unflushed_file_id_ << ", in-flight)";
             continue;
         }
 
@@ -1159,11 +1222,11 @@ KvError DeleteUnreferencedLocalSegmentFiles(
         // protect ids beyond max at or above the branch's newest known term.
         auto it = branch_guards.find(branch_name);
         if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id > it->second.max_segment_file_id_)
+            file_id >= it->second.least_unflushed_seg_file_id_)
         {
             DLOG(INFO) << "ExecuteLocalGC: keep segment file " << file_name
-                       << " (file_id=" << file_id
-                       << " > max=" << it->second.max_segment_file_id_
+                       << " (file_id=" << file_id << " >= least_unflushed="
+                       << it->second.least_unflushed_seg_file_id_
                        << ", in-flight)";
             continue;
         }
@@ -1243,7 +1306,7 @@ KvError DeleteUnreferencedCloudSegmentFiles(
         // DeleteUnreferencedLocalSegmentFiles.
         auto it = branch_guards.find(branch_name);
         if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id > it->second.max_segment_file_id_)
+            file_id >= it->second.least_unflushed_seg_file_id_)
         {
             continue;
         }
@@ -1355,12 +1418,19 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
     }
 
     // 3a. augment retained_files / retained_segment_files from all branch
-    // manifests (regular + archive) in cloud and build branch_guards. Pre-
-    // seed the local active branch at process_term so files written before
-    // the first manifest flush at this term are still protected.
+    // manifests (regular + archive) in cloud and build branch_guards. The
+    // local active branch's in-memory RootMeta tracks the boundary of the
+    // flushed region (RootMeta::first_unflushed_*_fp_id_) more currently
+    // than any remote manifest does, so we seed the active branch guard
+    // from there.
     BranchGuardMap branch_guards;
-    branch_guards.emplace(std::string(cloud_mgr->GetActiveBranch()),
-                          BranchGuard{process_term, 0, 0});
+    SeedActiveBranchGuardFromInMemory(
+        tbl_id,
+        cloud_mgr->GetActiveBranch(),
+        process_term,
+        cloud_mgr->options_->pages_per_file_shift,
+        cloud_mgr->options_->segments_per_file_shift,
+        branch_guards);
     err = AugmentRetainedFilesFromBranchManifests(
         tbl_id,
         manifest_branch_names,

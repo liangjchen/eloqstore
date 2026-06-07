@@ -184,6 +184,8 @@ std::pair<RootMetaMgr::Handle, KvError> PageManager::FindRoot(
         auto mapper =
             replayer.GetMapper(this, &entry_tbl, IoMgr()->ProcessTerm());
         MappingSnapshot *mapping = mapper->GetMapping();
+        meta->first_unflushed_fp_id_ =
+            mapper->FilePgAllocator()->MaxFilePageId();
         meta->mapper_ = std::move(mapper);
         meta->mapping_snapshots_.insert(mapping);
         auto seg_mapper =
@@ -191,6 +193,8 @@ std::pair<RootMetaMgr::Handle, KvError> PageManager::FindRoot(
         if (seg_mapper != nullptr)
         {
             MappingSnapshot *seg_mapping = seg_mapper->GetMapping();
+            meta->first_unflushed_seg_fp_id_ =
+                seg_mapper->FilePgAllocator()->MaxFilePageId();
             meta->segment_mapper_ = std::move(seg_mapper);
             meta->segment_mapping_snapshots_.insert(seg_mapping);
         }
@@ -414,6 +418,8 @@ void PageManager::UpdateRoot(const TableIdent &tbl_ident, CowRootMeta new_meta)
     meta.manifest_size_ = new_meta.manifest_size_;
     meta.next_expire_ts_ = new_meta.next_expire_ts_;
     meta.compression_ = std::move(new_meta.compression_);
+    meta.first_unflushed_fp_id_ = new_meta.first_unflushed_fp_id_;
+    meta.first_unflushed_seg_fp_id_ = new_meta.first_unflushed_seg_fp_id_;
     root_meta_mgr_.UpdateBytes(entry, RootMetaBytes(meta));
     root_meta_mgr_.EvictIfNeeded();
 }
@@ -456,6 +462,7 @@ KvError PageManager::InstallEmptySnapshot(const TableIdent &tbl_ident,
     auto it = meta.mapping_snapshots_.insert(cow_meta.mapper_->GetMapping());
     CHECK(it.second);
     cow_meta.manifest_size_ = snapshot.size();
+    cow_meta.first_unflushed_fp_id_ = max_fp_id;
 
     UpdateRoot(tbl_ident, std::move(cow_meta));
     IoMgr()->SetBranchFileMapping(entry->tbl_id_, {});
@@ -582,10 +589,25 @@ KvError PageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
         }
     }
 
+    // Replay the segment mapper as well so a reopened partition keeps any
+    // persisted segment mapping (very-large values). Mirrors the load_meta
+    // path in FindRoot.
+    auto seg_mapper = replayer.GetSegmentMapper(
+        this, &entry->tbl_id_, IoMgr()->ProcessTerm());
+
     cow_meta = CowRootMeta();
     cow_meta.root_id_ = replayer.root_;
     cow_meta.ttl_root_id_ = replayer.ttl_root_;
+    cow_meta.first_unflushed_fp_id_ =
+        mapper->FilePgAllocator()->MaxFilePageId();
     cow_meta.mapper_ = std::move(mapper);
+    if (seg_mapper != nullptr)
+    {
+        meta.segment_mapping_snapshots_.insert(seg_mapper->GetMapping());
+        cow_meta.first_unflushed_seg_fp_id_ =
+            seg_mapper->FilePgAllocator()->MaxFilePageId();
+        cow_meta.segment_mapper_ = std::move(seg_mapper);
+    }
     cow_meta.manifest_size_ = replayer.file_size_;
     cow_meta.next_expire_ts_ = replayer.ttl_root_ != MaxPageId ? 1 : 0;
     cow_meta.compression_ = std::make_shared<compression::DictCompression>();

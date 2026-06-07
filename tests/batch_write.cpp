@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -274,7 +275,13 @@ TEST_CASE("batch write task pool handles many partitions concurrently",
     }
 
     // Final truncate across all partitions to make sure TaskPool objects and
-    // mapping snapshots can be recycled repeatedly.
+    // mapping snapshots can be recycled repeatedly. Partitions whose wave2
+    // write exhausted its OOM retries were never recreated after trunc1
+    // cleaned them up, so Truncate on those surfaces NotFound rather than
+    // NoError. Both outcomes are valid recycle paths -- the test only fails
+    // on a different error class. (This case is rare in the regular build
+    // but more frequent under ASan, where the slower scheduling causes more
+    // wave2 batches to exhaust their retry budget.)
     std::vector<eloqstore::TruncateRequest> trunc2(partitions);
     for (uint32_t pid = 0; pid < partitions; ++pid)
     {
@@ -282,10 +289,22 @@ TEST_CASE("batch write task pool handles many partitions concurrently",
         trunc2[pid].SetTableId(tbl_id);
         REQUIRE(store->ExecAsyn(&trunc2[pid]));
     }
+    std::unordered_set<uint32_t> succeeded_set(succeeded.begin(),
+                                               succeeded.end());
     for (uint32_t pid = 0; pid < partitions; ++pid)
     {
         trunc2[pid].Wait();
-        REQUIRE(trunc2[pid].Error() == eloqstore::KvError::NoError);
+        eloqstore::KvError err = trunc2[pid].Error();
+        if (succeeded_set.count(pid) != 0)
+        {
+            // Wave2 wrote data into this partition, so Truncate must clear it.
+            REQUIRE(err == eloqstore::KvError::NoError);
+        }
+        else
+        {
+            REQUIRE((err == eloqstore::KvError::NoError ||
+                     err == eloqstore::KvError::NotFound));
+        }
     }
 }
 

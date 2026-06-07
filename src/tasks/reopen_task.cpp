@@ -86,10 +86,11 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
 
     const bool empty_snapshot =
         cow_meta_.root_id_ == MaxPageId && cow_meta_.ttl_root_id_ == MaxPageId;
-    if (mode == StoreMode::Cloud && empty_snapshot)
+    if (empty_snapshot &&
+        (mode == StoreMode::Cloud || mode == StoreMode::StandbyReplica))
     {
-        auto *cloud_mgr = static_cast<CloudStoreMgr *>(shard->IoManager());
-        err = cloud_mgr->CleanupLocalPartitionFiles(tbl_id);
+        auto *io_mgr = static_cast<IouringMgr *>(shard->IoManager());
+        err = io_mgr->CleanupLocalPartitionFiles(tbl_id);
         if (err != KvError::NoError)
         {
             LOG(ERROR) << "Reopen " << tbl_id

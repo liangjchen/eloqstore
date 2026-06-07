@@ -37,15 +37,21 @@ namespace FileGarbageCollector
 {
 // In-flight write guard state per branch. At most one writer instance may
 // operate on a branch, and only on that branch's newest term. The guard
-// records, per branch, that newest term plus the highest committed data /
-// segment file ids. A file at (branch, newest_term_) with id beyond max is
-// an in-flight write and must be preserved; files at any other term for
-// the same branch are by definition already complete.
+// records, per branch, that newest term plus the lowest data / segment
+// file_id whose pages haven't been captured by any flushed manifest yet.
+// Files at (branch, newest_term_) with file_id >= least_unflushed_* are
+// in-flight (or in a partially-flushed boundary file) and must be
+// preserved; files at any other term for the same branch are by
+// definition already complete.
+//
+// The fields are derived from in-memory RootMeta::first_unflushed_*_fp_id_
+// (for the active branch) and from disk manifest BranchFileRange::max_file_id_
+// (for all branches), combined via std::max.
 struct BranchGuard
 {
     uint64_t newest_term_{0};
-    FileId max_data_file_id_{0};
-    FileId max_segment_file_id_{0};
+    FileId least_unflushed_file_id_{0};
+    FileId least_unflushed_seg_file_id_{0};
 };
 using BranchGuardMap = absl::flat_hash_map<std::string, BranchGuard>;
 
@@ -68,12 +74,12 @@ KvError ListLocalFiles(const TableIdent &tbl_id,
 
 // In-flight write guard: for each on-disk file, look up its branch in
 // `branch_guards`. If the branch is present and the file's term is >= the
-// branch's newest_term_, any file_id beyond max_data_file_id_ is preserved
-// as an in-flight write. The `>=` comparison (not `==`) is required because
-// our manifest snapshot may lag a concurrent primary that has bumped its
-// term but not yet flushed a manifest at the new term. Files for branches
-// absent from the map, or at terms strictly below the branch's newest, are
-// not protected.
+// branch's newest_term_, any file_id at or above least_unflushed_file_id_
+// is preserved as an in-flight (or partially-flushed) write. The `>=`
+// term comparison (not `==`) is required because our manifest snapshot may
+// lag a concurrent primary that has bumped its term but not yet flushed a
+// manifest at the new term. Files for branches absent from the map, or at
+// terms strictly below the branch's newest, are not protected.
 KvError DeleteUnreferencedLocalFiles(
     const TableIdent &tbl_id,
     const std::vector<std::string> &data_files,
@@ -87,7 +93,7 @@ KvError DeleteUnreferencedLocalFiles(
 // `retained_segment_files` from both regular and archive manifests (see
 // AugmentRetainedFilesFromBranchManifests) so archive-referenced segments
 // are protected by inclusion in the retained set. The in-flight guard
-// mirrors DeleteUnreferencedLocalFiles, using max_segment_file_id_.
+// mirrors DeleteUnreferencedLocalFiles, using least_unflushed_seg_file_id_.
 KvError DeleteUnreferencedLocalSegmentFiles(
     const TableIdent &tbl_id,
     const std::vector<std::string> &segment_files,

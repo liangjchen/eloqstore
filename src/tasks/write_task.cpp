@@ -686,7 +686,10 @@ KvError WriteTask::FlushManifest()
     branch_metadata.file_ranges = IoMgr()->GetBranchFileMapping(tbl_ident_);
     YieldToLowPQ();
 
-    // Prepare segment mapping parameters for manifest serialization.
+    // Prepare data and segment mapping parameters for manifest serialization.
+    MappingSnapshot *mapping = cow_meta_.mapper_->GetMapping();
+    FilePageId max_fp_id =
+        cow_meta_.mapper_->FilePgAllocator()->MaxFilePageId();
     MappingSnapshot *seg_mapping = cow_meta_.segment_mapper_
                                        ? cow_meta_.segment_mapper_->GetMapping()
                                        : nullptr;
@@ -701,9 +704,6 @@ KvError WriteTask::FlushManifest()
     if (need_empty_snapshot)
     {
         // Write a snapshot with empty roots and empty mapping
-        MappingSnapshot *mapping = cow_meta_.mapper_->GetMapping();
-        FilePageId max_fp_id =
-            cow_meta_.mapper_->FilePgAllocator()->MaxFilePageId();
         std::string_view snapshot =
             wal_builder_.Snapshot(cow_meta_.root_id_,
                                   cow_meta_.ttl_root_id_,
@@ -716,6 +716,8 @@ KvError WriteTask::FlushManifest()
         err = IoMgr()->SwitchManifest(tbl_ident_, snapshot);
         CHECK_KV_ERR(err);
         cow_meta_.manifest_size_ = snapshot.size();
+        cow_meta_.first_unflushed_fp_id_ = max_fp_id;
+        cow_meta_.first_unflushed_seg_fp_id_ = max_seg_fp_id;
         cow_meta_.compression_->ClearDirty();
         return KvError::NoError;
     }
@@ -754,12 +756,11 @@ KvError WriteTask::FlushManifest()
         // Use the actual blob size (aligned) to keep manifest_size_ accurate.
         cow_meta_.manifest_size_ +=
             (blob.size() + alignment - 1) & ~(alignment - 1);
+        cow_meta_.first_unflushed_fp_id_ = max_fp_id;
+        cow_meta_.first_unflushed_seg_fp_id_ = max_seg_fp_id;
     }
     else
     {
-        MappingSnapshot *mapping = cow_meta_.mapper_->GetMapping();
-        FilePageId max_fp_id =
-            cow_meta_.mapper_->FilePgAllocator()->MaxFilePageId();
         std::string_view snapshot =
             wal_builder_.Snapshot(cow_meta_.root_id_,
                                   cow_meta_.ttl_root_id_,
@@ -772,6 +773,8 @@ KvError WriteTask::FlushManifest()
         err = IoMgr()->SwitchManifest(tbl_ident_, snapshot);
         CHECK_KV_ERR(err);
         cow_meta_.manifest_size_ = snapshot.size();
+        cow_meta_.first_unflushed_fp_id_ = max_fp_id;
+        cow_meta_.first_unflushed_seg_fp_id_ = max_seg_fp_id;
         cow_meta_.compression_->ClearDirty();
     }
     return KvError::NoError;

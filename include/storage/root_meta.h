@@ -103,6 +103,17 @@ struct RootMeta
     uint64_t next_expire_ts_{0};
     std::shared_ptr<compression::DictCompression> compression_{nullptr};
 
+    // Snapshot of the data / segment FilePageAllocator's MaxFilePageId() the
+    // last time a manifest for this table was successfully written. Same
+    // "smallest unallocated/unflushed" semantics as
+    // FilePageAllocator::max_fp_id_. Consumed by file GC to derive the
+    // per-branch in-flight boundary (BranchGuard::least_unflushed_file_id_);
+    // files at file_id < (first_unflushed_fp_id_ >> pages_per_file_shift) are
+    // fully captured by some disk manifest and become deletion candidates if
+    // unreferenced.
+    FilePageId first_unflushed_fp_id_{0};
+    FilePageId first_unflushed_seg_fp_id_{0};
+
     uint32_t ref_cnt_{0};
     bool locked_{false};
     WaitingZone waiting_;
@@ -227,6 +238,10 @@ struct CowRootMeta
     MappingSnapshot::Ref old_segment_mapping_{nullptr};
     uint64_t next_expire_ts_{};
     std::shared_ptr<compression::DictCompression> compression_{nullptr};
+    // Mirrors RootMeta::first_unflushed_*_fp_id_; written by WriteTask after
+    // a successful FlushManifest and propagated by PageManager::UpdateRoot.
+    FilePageId first_unflushed_fp_id_{0};
+    FilePageId first_unflushed_seg_fp_id_{0};
     RootMetaMgr::Handle root_handle_{};
 };
 

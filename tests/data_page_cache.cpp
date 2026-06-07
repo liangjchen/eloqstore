@@ -44,7 +44,8 @@ TEST_CASE("data page cache: flag off leaves counters untouched",
     REQUIRE(store->DataCacheMisses() == 0);
 }
 
-TEST_CASE("data page cache: write-then-read is a cache hit", "[data_page_cache]")
+TEST_CASE("data page cache: write-then-read is a cache hit",
+          "[data_page_cache]")
 {
     eloqstore::EloqStore *store = InitStore(CacheOpts());
     MapVerifier verify(test_tbl_id, store, false);
@@ -205,7 +206,10 @@ TEST_CASE("data page cache: OOM retry under concurrent writes",
         REQUIRE(store->ExecAsyn(&reqs[p]));
     }
     // Drain first.
-    for (auto &r : reqs) { r.Wait(); }
+    for (auto &r : reqs)
+    {
+        r.Wait();
+    }
     // Then check.
     for (auto &r : reqs)
     {
@@ -293,7 +297,6 @@ TEST_CASE("data page cache: OOM abort releases pinned pages",
     store->ExecSync(&read_req);
     // Best-effort: a NotFound or NoError are both fine; what we don't want
     // is a crash or assertion failure.
-    REQUIRE(
-        (read_req.Error() == eloqstore::KvError::NoError ||
-         read_req.Error() == eloqstore::KvError::NotFound));
+    REQUIRE((read_req.Error() == eloqstore::KvError::NoError ||
+             read_req.Error() == eloqstore::KvError::NotFound));
 }

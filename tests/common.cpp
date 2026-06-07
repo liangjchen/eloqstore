@@ -6,21 +6,45 @@
 #include <filesystem>
 #include <string>
 
+#include "utils.h"
+
 eloqstore::EloqStore *InitStore(const eloqstore::KvOptions &opts)
 {
     static std::unique_ptr<eloqstore::EloqStore> eloq_store = nullptr;
 
-    if (eloq_store && !eloq_store->IsStopped())
+    // Tear down any prior store before constructing the new one, so the old
+    // destructor's worker-thread joins and LRU-cached fd releases finish
+    // before we count the new store's fd budget below.
+    if (eloq_store)
     {
-        eloq_store->Stop();
+        if (!eloq_store->IsStopped())
+        {
+            eloq_store->Stop();
+        }
+        eloq_store.reset();
     }
     if (!opts.cloud_store_path.empty())
     {
         S3TestClient s3_client(opts);
     }
     CleanupStore(opts);
+
+    // EloqStore::Start() counts the *process-wide* `/proc/self/fd` and
+    // subtracts it from `fd_limit`. When multiple test cases run in the
+    // same binary, glog log fds, minio HTTP sockets, catch2 internals, and
+    // any fd that hasn't fully drained from a prior store all accumulate
+    // in /proc/self/fd. Tests that pick a tight `fd_limit` to exercise
+    // LRU-eviction (e.g. persist's "simple/complex LRU for opened fd" with
+    // fd_limit = 20 + num_reserved_fd) then see Start() collapse
+    // `shard_fd_limit` to 0 and return KvError::OpenFileLimit. Re-base the
+    // budget on the current process fd count so the caller-provided limit
+    // is honored as a *per-store* number regardless of how many tests ran
+    // before this one.
+    eloqstore::KvOptions adjusted_opts = opts;
+    adjusted_opts.fd_limit += utils::CountUsedFD();
+
     // Recreate to ensure latest options are applied
-    eloq_store = std::make_unique<eloqstore::EloqStore>(opts);
+    eloq_store = std::make_unique<eloqstore::EloqStore>(adjusted_opts);
     eloqstore::KvError err = eloq_store->Start(eloqstore::MainBranchName, 0);
     CHECK(err == eloqstore::KvError::NoError);
     return eloq_store.get();
