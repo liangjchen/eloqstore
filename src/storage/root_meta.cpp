@@ -335,20 +335,6 @@ bool RootMetaMgr::EvictRootForCache(Entry *entry)
         CHECK(!page->IsPinned())
             << "EvictRootForCache: index page pinned table " << tbl_id;
     }
-    if (meta.mapper_->MappingCount() == 0 && meta.manifest_size_ > 0)
-    {
-        meta.locked_ = true;
-        LOG(INFO) << "Evicting manifest for table " << tbl_id << " size "
-                  << meta.manifest_size_;
-        KvError err = owner_->IoMgr()->CleanManifest(tbl_id);
-        if (err != KvError::NoError)
-        {
-            LOG(WARNING) << "Failed to clean manifest for table " << tbl_id
-                         << ": " << ErrorString(err);
-        }
-        meta.waiting_.WakeAll();
-    }
-
     std::vector<MemCachedPage *> pages(meta.cached_pages_.begin(),
                                        meta.cached_pages_.end());
     for (MemCachedPage *page : pages)

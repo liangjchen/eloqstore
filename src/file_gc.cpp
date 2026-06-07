@@ -335,8 +335,9 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
 
     if (data_files.empty() && archive_files.empty())
     {
-        // TODO: local mode should eventually clean the manifest and remove
-        // the empty partition directory (like CleanManifest does).
+        // Keep the manifest: truncate leaves an empty partition, while only
+        // Drop removes the manifest. This only removes the directory if it is
+        // already empty.
         err = io_mgr->TryCleanupLocalPartitionDir(tbl_id);
         if (err != KvError::NoError)
         {

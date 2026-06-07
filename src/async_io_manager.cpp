@@ -1586,65 +1586,6 @@ KvError CloudStoreMgr::TryCleanupLocalPartitionDir(const TableIdent &tbl_id)
     return IouringMgr::TryCleanupLocalPartitionDir(tbl_id);
 }
 
-KvError IouringMgr::CleanManifest(const TableIdent &tbl_id)
-{
-    if (HasOtherFile(tbl_id))
-    {
-        DLOG(INFO) << "Skip cleaning manifest for " << tbl_id
-                   << " because other files are present";
-        return KvError::Busy;
-    }
-
-    uint64_t process_term = ProcessTerm();
-    KvError dir_err = KvError::NoError;
-    auto [dir_fd, err] = OpenFD(tbl_id, LruFD::kDirectory, false, "", 0);
-    dir_err = err;
-    if (dir_err == KvError::NoError)
-    {
-        const std::string manifest_name =
-            BranchManifestFileName(GetActiveBranch(), process_term);
-        int res = UnlinkAt(dir_fd.FdPair(), manifest_name.c_str(), false);
-        if (res < 0 && res != -ENOENT)
-        {
-            LOG(ERROR) << "Failed to delete manifest file for table " << tbl_id
-                       << ": " << strerror(-res);
-            KvError close_dir_err = CloseFile(std::move(dir_fd));
-            if (close_dir_err != KvError::NoError)
-            {
-                LOG(WARNING) << "Failed to close directory handle for table "
-                             << tbl_id << ": " << ErrorString(close_dir_err);
-            }
-            return ToKvError(res);
-        }
-        else if (res == 0)
-        {
-            DLOG(INFO) << "Successfully deleted manifest file for table "
-                       << tbl_id;
-        }
-
-        KvError close_dir_err = CloseFile(std::move(dir_fd));
-        if (close_dir_err != KvError::NoError)
-        {
-            LOG(WARNING) << "Failed to close directory handle for table "
-                         << tbl_id << ": " << ErrorString(close_dir_err);
-        }
-    }
-    if (dir_err != KvError::NoError && dir_err != KvError::NotFound)
-    {
-        LOG(ERROR) << "Failed to open directory for table " << tbl_id
-                   << " during cleanup: " << ErrorString(dir_err);
-        return dir_err;
-    }
-    KvError cleanup_err = TryCleanupLocalPartitionDir(tbl_id);
-    if (cleanup_err != KvError::NoError)
-    {
-        LOG(WARNING) << "Failed to clean partition directory for table "
-                     << tbl_id << ": " << ErrorString(cleanup_err);
-        return cleanup_err;
-    }
-    return KvError::NoError;
-}
-
 KvError ToKvError(int err_no)
 {
     if (err_no >= 0)
@@ -5317,38 +5258,10 @@ KvError CloudStoreMgr::SwitchManifest(const TableIdent &tbl_id,
     return KvError::NoError;
 }
 
-KvError CloudStoreMgr::CleanManifest(const TableIdent &tbl_id)
-{
-    KvError err = IouringMgr::CleanManifest(tbl_id);
-    if (err != KvError::NoError)
-    {
-        return err;
-    }
-    if (DequeClosedFile(FileKey(
-            tbl_id, BranchManifestFileName(GetActiveBranch(), ProcessTerm()))))
-    {
-        const size_t manifest_size = options_->manifest_limit;
-        used_local_space_ = used_local_space_ > manifest_size
-                                ? used_local_space_ - manifest_size
-                                : 0;
-    }
-    if (!HasTrackedLocalFiles(tbl_id))
-    {
-        KvError cleanup_err = TryCleanupLocalPartitionDir(tbl_id);
-        if (cleanup_err != KvError::NoError)
-        {
-            LOG(WARNING) << "Failed to clean partition directory for table "
-                         << tbl_id << ": " << ErrorString(cleanup_err);
-            return cleanup_err;
-        }
-    }
-    return KvError::NoError;
-}
-
 KvError IouringMgr::DropManifest(const TableIdent &tbl_id)
 {
-    // Unlike CleanManifest, we do NOT check HasOtherFile — data files are
-    // expected to still be present; GC will clean them later.
+    // Do not check HasOtherFile: data files are expected to still be present;
+    // GC will clean them later.
     uint64_t process_term = ProcessTerm();
     auto [dir_fd, dir_err] =
         OpenFD(tbl_id, LruFD::kDirectory, false, "", 0);
@@ -7280,11 +7193,6 @@ KvError MemStoreMgr::SyncData(const TableIdent &tbl_id)
 }
 
 KvError MemStoreMgr::AbortWrite(const TableIdent &tbl_id)
-{
-    return KvError::NoError;
-}
-
-KvError MemStoreMgr::CleanManifest(const TableIdent &tbl_id)
 {
     return KvError::NoError;
 }
