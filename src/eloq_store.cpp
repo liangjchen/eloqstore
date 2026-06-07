@@ -557,8 +557,6 @@ void EloqStore::CleanupRuntime(size_t started_shards)
 {
     const size_t shard_count = std::min(started_shards, shards_.size());
 
-    DLOG(INFO) << "EloqStore::CleanupRuntime stage=begin"
-               << ", started_shards=" << shard_count;
     for (size_t i = 0; i < shard_count; ++i)
     {
         if (shards_[i] != nullptr)
@@ -568,19 +566,15 @@ void EloqStore::CleanupRuntime(size_t started_shards)
     }
     if (prewarm_service_ != nullptr)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_prewarm";
         prewarm_service_->Stop();
     }
     if (archive_crond_ != nullptr)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_archive_crond";
         archive_crond_->Stop();
     }
 #ifdef ELOQ_MODULE_ENABLED
     if (module_ != nullptr)
     {
-        DLOG(INFO)
-            << "EloqStore::CleanupRuntime stage=signal_module_workers_stop";
         for (size_t i = 0; i < shard_count; ++i)
         {
             if (shards_[i] != nullptr)
@@ -591,8 +585,6 @@ void EloqStore::CleanupRuntime(size_t started_shards)
                     static_cast<int>(shards_[i]->shard_id_));
             }
         }
-        DLOG(INFO)
-            << "EloqStore::CleanupRuntime stage=wait_module_workers_stop";
         while (true)
         {
             bool all_stopped = true;
@@ -612,12 +604,10 @@ void EloqStore::CleanupRuntime(size_t started_shards)
             }
             bthread_usleep(1000);
         }
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=unregister_module";
         eloq::unregister_module(module_.get());
     }
 #endif
 
-    DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_shards";
     for (size_t i = 0; i < shard_count; ++i)
     {
         if (shards_[i] != nullptr)
@@ -626,7 +616,6 @@ void EloqStore::CleanupRuntime(size_t started_shards)
         }
     }
 
-    DLOG(INFO) << "EloqStore::CleanupRuntime stage=clear_resources";
     shards_.clear();
 
     for (int fd : root_fds_)
@@ -639,12 +628,10 @@ void EloqStore::CleanupRuntime(size_t started_shards)
     // can finish.
     if (standby_service_)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_standby_service";
         standby_service_->Stop();
     }
     if (cloud_service_)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_cloud_service";
         cloud_service_->Stop();
     }
     if (eloq_store == this)
@@ -752,10 +739,7 @@ KvError EloqStore::Start(std::string_view branch,
     // Initialize
     if (!options_.store_path.empty())
     {
-        DLOG(INFO) << "EloqStore::Start stage=init_store_space_begin";
         KvError err = InitStoreSpace();
-        DLOG(INFO) << "EloqStore::Start stage=init_store_space_end err="
-                   << ErrorString(err);
         if (err != KvError::NoError)
         {
             return fail_start(err);
@@ -791,14 +775,11 @@ KvError EloqStore::Start(std::string_view branch,
     shards_.resize(options_.num_threads);
     for (size_t i = 0; i < options_.num_threads; i++)
     {
-        DLOG(INFO) << "EloqStore::Start stage=shard_init_begin shard=" << i;
         if (shards_[i] == nullptr)
         {
             shards_[i] = std::make_unique<Shard>(this, i, shard_fd_limit);
         }
         KvError err = shards_[i]->Init();
-        DLOG(INFO) << "EloqStore::Start stage=shard_init_end shard=" << i
-                   << ", err=" << ErrorString(err);
         if (err != KvError::NoError)
         {
             return fail_start(err);
@@ -807,15 +788,8 @@ KvError EloqStore::Start(std::string_view branch,
 
     if (cloud_service_)
     {
-        DLOG(INFO) << "EloqStore::Start stage=sync_current_term_begin";
-        DLOG(INFO) << "EloqStore::Start stage=cloud_service_start_begin";
         cloud_service_->Start();
-        DLOG(INFO) << "EloqStore::Start stage=cloud_service_start_end";
-
-        DLOG(INFO) << "EloqStore::Start stage=sync_current_term_wait";
         cloud_service_->bootstrap_state_.Wait();
-        DLOG(INFO) << "EloqStore::Start stage=sync_current_term_done err="
-                   << ErrorString(cloud_service_->bootstrap_state_.err_);
         if (cloud_service_->bootstrap_state_.err_ != KvError::NoError)
         {
             return fail_start(cloud_service_->bootstrap_state_.err_);
@@ -823,29 +797,23 @@ KvError EloqStore::Start(std::string_view branch,
     }
     else if (standby_service_)
     {
-        DLOG(INFO) << "EloqStore::Start stage=standby_service_start_begin";
         standby_service_->Start();
-        DLOG(INFO) << "EloqStore::Start stage=standby_service_start_end";
     }
 
     // Start threads.
     for (size_t i = 0; i < shards_.size(); ++i)
     {
-        DLOG(INFO) << "EloqStore::Start stage=shard_start_begin shard=" << i;
         shards_[i]->Start();
-        DLOG(INFO) << "EloqStore::Start stage=shard_start_end shard=" << i;
         ++started_shards;
     }
 
 #ifdef ELOQ_MODULE_ENABLED
-    DLOG(INFO) << "EloqStore::Start stage=module_register_begin";
     module_ = std::make_unique<EloqStoreModule>(&shards_);
     eloq::register_module(module_.get());
     for (auto &shard : shards_)
     {
         eloq::EloqModule::NotifyWorker(static_cast<int>(shard->shard_id_));
     }
-    DLOG(INFO) << "EloqStore::Start stage=module_register_end";
 #endif
 
     if (options_.data_append_mode && options_.num_retained_archives > 0 &&
@@ -1142,7 +1110,6 @@ KvError EloqStore::CollectTablePartitions(
                     continue;
                 }
                 std::string name = entry.path().filename().string();
-                DLOG(INFO) << "CollectTablePartitions: " << name;
                 TableIdent ident = TableIdent::FromString(name);
                 if (!ident.IsValid() || ident.tbl_name_ != table_name)
                 {
