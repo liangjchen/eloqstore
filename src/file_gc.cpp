@@ -115,23 +115,19 @@ void SeedActiveBranchGuardFromInMemory(const TableIdent &tbl_id,
                                        uint8_t segments_per_file_shift,
                                        BranchGuardMap &branch_guards)
 {
+    assert(shard != nullptr);
+    RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
+    RootMetaMgr::Entry *entry = root_meta_mgr->Find(tbl_id);
+    if (entry == nullptr)
+        return;
     BranchGuard guard{process_term, 0, 0};
-
-    if (shard != nullptr)
-    {
-        RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
-        RootMetaMgr::Entry *entry = root_meta_mgr->Find(tbl_id);
-        if (entry != nullptr)
-        {
-            // No yields between Find() and the field reads below, so the
-            // entry cannot be evicted out from under us; no Handle pin needed.
-            const RootMeta &meta = entry->meta_;
-            guard.least_unflushed_file_id_ =
-                meta.first_unflushed_fp_id_ >> pages_per_file_shift;
-            guard.least_unflushed_seg_file_id_ =
-                meta.first_unflushed_seg_fp_id_ >> segments_per_file_shift;
-        }
-    }
+    // No yields between Find() and the field reads below, so the
+    // entry cannot be evicted out from under us; no Handle pin needed.
+    const RootMeta &meta = entry->meta_;
+    guard.least_unflushed_file_id_ =
+        meta.first_unflushed_fp_id_ >> pages_per_file_shift;
+    guard.least_unflushed_seg_file_id_ =
+        meta.first_unflushed_seg_fp_id_ >> segments_per_file_shift;
 
     branch_guards.emplace(std::string(active_branch), guard);
 }
@@ -335,9 +331,6 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
 
     if (data_files.empty() && archive_files.empty())
     {
-        // Keep the manifest: truncate leaves an empty partition, while only
-        // Drop removes the manifest. This only removes the directory if it is
-        // already empty.
         err = io_mgr->TryCleanupLocalPartitionDir(tbl_id);
         if (err != KvError::NoError)
         {
@@ -911,12 +904,23 @@ KvError DeleteUnreferencedCloudFiles(
             continue;
         }
 
-        // In-flight write guard. See DeleteUnreferencedLocalFiles for the
-        // semantics: protect ids beyond max at or above the branch's newest
-        // known term.
+        // In-flight write guard. A missing guard for the active branch means
+        // its manifest was dropped/reopened and the unretained file can be
+        // deleted. For other branches, missing guard means we do not have a
+        // flushed boundary, so preserve the file conservatively.
         auto it = branch_guards.find(branch_name);
-        if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id >= it->second.least_unflushed_file_id_)
+        if (it == branch_guards.end())
+        {
+            if (branch_name != active_branch)
+            {
+                DLOG(INFO) << "skip file " << file_name
+                           << " (missing branch guard for non-active branch "
+                           << branch_name << ")";
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_file_id_)
         {
             DLOG(INFO) << "skip file " << file_name << " (file_id=" << file_id
                        << " >= least_unflushed="
@@ -1065,8 +1069,10 @@ KvError DeleteUnreferencedLocalFiles(
                                          io_mgr->options_->store_path_lut);
 
     std::vector<std::string> files_to_delete;
+    std::vector<std::string> filenames_to_delete;
     std::vector<TypedFileId> file_ids_to_close;
     files_to_delete.reserve(data_files.size());
+    filenames_to_delete.reserve(data_files.size());
     file_ids_to_close.reserve(data_files.size());
 
     for (const std::string &file_name : data_files)
@@ -1095,16 +1101,23 @@ KvError DeleteUnreferencedLocalFiles(
             continue;
         }
 
-        // In-flight write guard. Look up the file's branch; if the file
-        // sits at or above the branch's newest known term and its id is
-        // beyond the highest committed, treat as in-flight and preserve.
-        // `>=` (not `==`) is required because our manifest snapshot may
-        // lag a concurrent primary that has bumped its term but not yet
-        // flushed a manifest at the new term. Files at lower terms for
-        // the same branch are by definition already complete.
+        // In-flight write guard. A missing guard for the active branch means
+        // its manifest was dropped/reopened and the unretained file can be
+        // deleted. For other branches, missing guard means we do not have a
+        // flushed boundary, so preserve the file conservatively.
         auto it = branch_guards.find(branch_name);
-        if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id >= it->second.least_unflushed_file_id_)
+        if (it == branch_guards.end())
+        {
+            if (branch_name != io_mgr->GetActiveBranch())
+            {
+                DLOG(INFO) << "ExecuteLocalGC: keep file " << file_name
+                           << " (missing branch guard for non-active branch "
+                           << branch_name << ")";
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_file_id_)
         {
             DLOG(INFO) << "ExecuteLocalGC: keep file " << file_name
                        << " (file_id=" << file_id << " >= least_unflushed="
@@ -1114,6 +1127,7 @@ KvError DeleteUnreferencedLocalFiles(
 
         fs::path file_path = dir_path / file_name;
         files_to_delete.push_back(file_path.string());
+        filenames_to_delete.push_back(file_name);
         file_ids_to_close.push_back(DataFileKey(file_id));
         DLOG(INFO) << "ExecuteLocalGC: marking file for deletion: " << file_name
                    << " (file_id=" << file_id << ")";
@@ -1131,16 +1145,28 @@ KvError DeleteUnreferencedLocalFiles(
                        << static_cast<int>(close_err);
             return close_err;
         }
-        // Delete files using batch operation
-        KvError delete_err = io_mgr->DeleteFiles(files_to_delete);
-        if (delete_err != KvError::NoError)
+
+        if (eloq_store->Mode() == StoreMode::Cloud)
         {
-            LOG(ERROR) << "ExecuteLocalGC: Failed to delete files, error: "
-                       << static_cast<int>(delete_err);
-            return delete_err;
+            static_cast<CloudStoreMgr *>(io_mgr)->ScheduleLocalFileCleanup(
+                tbl_id, filenames_to_delete);
+            DLOG(INFO) << "ExecuteLocalGC: scheduled "
+                       << files_to_delete.size()
+                       << " unreferenced files for local cache cleanup";
         }
-        DLOG(INFO) << "ExecuteLocalGC: Successfully deleted "
-                   << files_to_delete.size() << " unreferenced files";
+        else
+        {
+            // Delete files using batch operation
+            KvError delete_err = io_mgr->DeleteFiles(files_to_delete);
+            if (delete_err != KvError::NoError)
+            {
+                LOG(ERROR) << "ExecuteLocalGC: Failed to delete files, error: "
+                           << static_cast<int>(delete_err);
+                return delete_err;
+            }
+            DLOG(INFO) << "ExecuteLocalGC: Successfully deleted "
+                       << files_to_delete.size() << " unreferenced files";
+        }
     }
     else
     {
@@ -1162,8 +1188,10 @@ KvError DeleteUnreferencedLocalSegmentFiles(
                                          io_mgr->options_->store_path_lut);
 
     std::vector<std::string> files_to_delete;
+    std::vector<std::string> filenames_to_delete;
     std::vector<TypedFileId> file_ids_to_close;
     files_to_delete.reserve(segment_files.size());
+    filenames_to_delete.reserve(segment_files.size());
     file_ids_to_close.reserve(segment_files.size());
 
     for (const std::string &file_name : segment_files)
@@ -1188,11 +1216,22 @@ KvError DeleteUnreferencedLocalSegmentFiles(
             continue;
         }
 
-        // In-flight write guard. Mirrors DeleteUnreferencedLocalFiles:
-        // protect ids beyond max at or above the branch's newest known term.
+        // In-flight write guard. Missing guard keeps non-active branches
+        // conservative, but does not protect the active branch after its
+        // manifest was dropped/reopened.
         auto it = branch_guards.find(branch_name);
-        if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id >= it->second.least_unflushed_seg_file_id_)
+        if (it == branch_guards.end())
+        {
+            if (branch_name != io_mgr->GetActiveBranch())
+            {
+                DLOG(INFO) << "ExecuteLocalGC: keep segment file " << file_name
+                           << " (missing branch guard for non-active branch "
+                           << branch_name << ")";
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_seg_file_id_)
         {
             DLOG(INFO) << "ExecuteLocalGC: keep segment file " << file_name
                        << " (file_id=" << file_id << " >= least_unflushed="
@@ -1203,6 +1242,7 @@ KvError DeleteUnreferencedLocalSegmentFiles(
 
         fs::path file_path = dir_path / file_name;
         files_to_delete.push_back(file_path.string());
+        filenames_to_delete.push_back(file_name);
         file_ids_to_close.push_back(SegmentFileKey(file_id));
     }
 
@@ -1220,15 +1260,26 @@ KvError DeleteUnreferencedLocalSegmentFiles(
             << static_cast<int>(close_err);
         return close_err;
     }
-    KvError delete_err = io_mgr->DeleteFiles(files_to_delete);
-    if (delete_err != KvError::NoError)
+    if (eloq_store->Mode() == StoreMode::Cloud)
     {
-        LOG(ERROR) << "ExecuteLocalGC: failed to delete segment files, error: "
-                   << static_cast<int>(delete_err);
-        return delete_err;
+        static_cast<CloudStoreMgr *>(io_mgr)->ScheduleLocalFileCleanup(
+            tbl_id, filenames_to_delete);
+        DLOG(INFO) << "ExecuteLocalGC: scheduled " << files_to_delete.size()
+                   << " unreferenced segment files for local cache cleanup";
     }
-    DLOG(INFO) << "ExecuteLocalGC: deleted " << files_to_delete.size()
-               << " unreferenced segment files";
+    else
+    {
+        KvError delete_err = io_mgr->DeleteFiles(files_to_delete);
+        if (delete_err != KvError::NoError)
+        {
+            LOG(ERROR)
+                << "ExecuteLocalGC: failed to delete segment files, error: "
+                << static_cast<int>(delete_err);
+            return delete_err;
+        }
+        DLOG(INFO) << "ExecuteLocalGC: deleted " << files_to_delete.size()
+                   << " unreferenced segment files";
+    }
     return KvError::NoError;
 }
 
@@ -1271,12 +1322,19 @@ KvError DeleteUnreferencedCloudSegmentFiles(
             continue;
         }
 
-        // In-flight write guard. Mirrors the data-file path's check in
-        // DeleteUnreferencedCloudFiles and the local-side check in
-        // DeleteUnreferencedLocalSegmentFiles.
+        // In-flight write guard. Mirrors the data-file path's missing-guard
+        // handling: active branch can be collected, non-active branches are
+        // preserved conservatively.
         auto it = branch_guards.find(branch_name);
-        if (it != branch_guards.end() && term >= it->second.newest_term_ &&
-            file_id >= it->second.least_unflushed_seg_file_id_)
+        if (it == branch_guards.end())
+        {
+            if (branch_name != cloud_mgr->GetActiveBranch())
+            {
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_seg_file_id_)
         {
             continue;
         }

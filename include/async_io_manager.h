@@ -657,12 +657,6 @@ public:
     }
 
     virtual KvError TryCleanupLocalPartitionDir(const TableIdent &tbl_id);
-    // Remove all files under the partition directory and then the directory
-    // itself. Used by reopen paths that install an empty snapshot, where the
-    // local files (left over from a previous primary or earlier generation)
-    // no longer belong to the current in-memory mapping. CloudStoreMgr
-    // overrides this to coordinate with its tracked-file state.
-    virtual KvError CleanupLocalPartitionFiles(const TableIdent &tbl_id);
     KvError DropManifest(const TableIdent &tbl_id) override;
 
     static constexpr uint64_t oflags_dir = O_DIRECTORY | O_RDONLY;
@@ -1281,7 +1275,6 @@ public:
     std::pair<ManifestFilePtr, KvError> RefreshManifest(
         const TableIdent &tbl_id, std::string_view archive_tag);
     KvError TryCleanupLocalPartitionDir(const TableIdent &tbl_id) override;
-    KvError CleanupLocalPartitionFiles(const TableIdent &tbl_id) override;
     void ScheduleLocalFileCleanup(const TableIdent &tbl_id,
                                   const std::vector<std::string> &filenames);
     void RegisterDirBusy(const TableIdent &tbl_id) override;
@@ -1459,6 +1452,7 @@ private:
     std::unordered_set<FileKey> pending_gc_cleanup_;
     std::unordered_map<TableIdent, size_t> closed_file_counts_;
     std::deque<TableIdent> pending_dir_cleanup_;
+    std::unordered_set<TableIdent> pending_busy_dir_cleanup_;
     std::unordered_map<TableIdent, uint32_t> dir_busy_counts_;
     CachedFile lru_file_head_;
     CachedFile lru_file_tail_;

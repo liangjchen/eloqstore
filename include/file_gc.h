@@ -78,8 +78,9 @@ KvError ListLocalFiles(const TableIdent &tbl_id,
 // is preserved as an in-flight (or partially-flushed) write. The `>=`
 // term comparison (not `==`) is required because our manifest snapshot may
 // lag a concurrent primary that has bumped its term but not yet flushed a
-// manifest at the new term. Files for branches absent from the map, or at
-// terms strictly below the branch's newest, are not protected.
+// manifest at the new term. If a branch is absent from the map, files for the
+// active branch are not protected (the manifest may have been dropped or
+// reopened), while files for non-active branches are preserved conservatively.
 KvError DeleteUnreferencedLocalFiles(
     const TableIdent &tbl_id,
     const std::vector<std::string> &data_files,

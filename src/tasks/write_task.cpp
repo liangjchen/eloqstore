@@ -940,7 +940,7 @@ void WriteTask::TriggerFileGC() const
     }
 
     // Check if we're in cloud mode or local mode
-    if (!Options()->cloud_store_path.empty())
+    if (eloq_store->Mode() == StoreMode::Cloud)
     {
         // Cloud mode: execute GC directly
         CloudStoreMgr *cloud_mgr =

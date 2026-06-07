@@ -1454,123 +1454,12 @@ KvError IouringMgr::TryCleanupLocalPartitionDir(const TableIdent &tbl_id)
     return ToKvError(dir_res);
 }
 
-KvError IouringMgr::CleanupLocalPartitionFiles(const TableIdent &tbl_id)
-{
-    namespace fs = std::filesystem;
-
-    const fs::path partition_path =
-        tbl_id.StorePath(options_->store_path, options_->store_path_lut);
-    std::error_code ec;
-    if (!fs::exists(partition_path, ec))
-    {
-        return ec ? ToKvError(-ec.value()) : KvError::NoError;
-    }
-
-    // Collect filenames first so we can close any LRU-cached fds tied to them
-    // before unlinking, then issue a batched delete.
-    std::vector<std::string> to_delete_full;
-    std::vector<TypedFileId> data_ids_to_close;
-    std::vector<TypedFileId> segment_ids_to_close;
-    bool saw_manifest = false;
-    for (fs::directory_iterator it(partition_path, ec), end; it != end;
-         it.increment(ec))
-    {
-        if (ec)
-        {
-            return ToKvError(-ec.value());
-        }
-        const fs::file_status status = it->status(ec);
-        if (ec)
-        {
-            return ToKvError(-ec.value());
-        }
-        if (!fs::is_regular_file(status))
-        {
-            continue;
-        }
-        const std::string name = it->path().filename().string();
-        to_delete_full.push_back(it->path().string());
-
-        auto [type, suffix] = ParseFileName(name);
-        if (type == FileNameData)
-        {
-            FileId file_id = 0;
-            std::string_view branch_name;
-            uint64_t term = 0;
-            if (ParseDataFileSuffix(suffix, file_id, branch_name, term))
-            {
-                data_ids_to_close.push_back(DataFileKey(file_id));
-            }
-        }
-        else if (type == FileNameSegment)
-        {
-            FileId file_id = 0;
-            std::string_view branch_name;
-            uint64_t term = 0;
-            if (ParseSegmentFileSuffix(suffix, file_id, branch_name, term))
-            {
-                segment_ids_to_close.push_back(SegmentFileKey(file_id));
-            }
-        }
-        else if (type == FileNameManifest)
-        {
-            saw_manifest = true;
-        }
-    }
-
-    if (!data_ids_to_close.empty())
-    {
-        KvError close_err = CloseFiles(tbl_id, data_ids_to_close);
-        if (close_err != KvError::NoError)
-        {
-            LOG(WARNING) << "CleanupLocalPartitionFiles: failed to close data "
-                            "fds for "
-                         << tbl_id << ": " << ErrorString(close_err);
-        }
-    }
-    if (!segment_ids_to_close.empty())
-    {
-        KvError close_err = CloseFiles(tbl_id, segment_ids_to_close);
-        if (close_err != KvError::NoError)
-        {
-            LOG(WARNING) << "CleanupLocalPartitionFiles: failed to close "
-                            "segment fds for "
-                         << tbl_id << ": " << ErrorString(close_err);
-        }
-    }
-    if (saw_manifest)
-    {
-        // CleanManifest closes the manifest fd cleanly; ignore "Busy" since
-        // we'll force-unlink anyway via the loop below.
-        KvError manifest_err = CleanManifest(tbl_id);
-        if (manifest_err != KvError::NoError && manifest_err != KvError::Busy &&
-            manifest_err != KvError::NotFound)
-        {
-            LOG(WARNING) << "CleanupLocalPartitionFiles: CleanManifest failed "
-                            "for "
-                         << tbl_id << ": " << ErrorString(manifest_err);
-        }
-    }
-
-    if (!to_delete_full.empty())
-    {
-        KvError del_err = DeleteFiles(to_delete_full);
-        if (del_err != KvError::NoError)
-        {
-            LOG(ERROR) << "CleanupLocalPartitionFiles: DeleteFiles failed for "
-                       << tbl_id << ": " << ErrorString(del_err);
-            return del_err;
-        }
-    }
-
-    return TryCleanupLocalPartitionDir(tbl_id);
-}
-
 KvError CloudStoreMgr::TryCleanupLocalPartitionDir(const TableIdent &tbl_id)
 {
     const std::string partition_name = tbl_id.ToString();
     if (HasDirBusy(tbl_id))
     {
+        pending_busy_dir_cleanup_.insert(tbl_id);
         DLOG(INFO) << "Skip cleaning partition directory " << partition_name
                    << " because directory is busy";
         return KvError::NoError;
@@ -1583,6 +1472,7 @@ KvError CloudStoreMgr::TryCleanupLocalPartitionDir(const TableIdent &tbl_id)
         return KvError::NoError;
     }
 
+    pending_busy_dir_cleanup_.erase(tbl_id);
     return IouringMgr::TryCleanupLocalPartitionDir(tbl_id);
 }
 
@@ -1856,6 +1746,7 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
                        << file_id.ToString() << " : " << ErrorString(error);
         }
         lru_fd.Get()->mu_.Unlock();
+        lru_fd = LruFD::Ref();
         return {nullptr, error};
     }
 
@@ -2537,7 +2428,6 @@ KvError IouringMgr::CloseFiles(std::span<LruFD::Ref> fds)
             }
         }
     }
-    DLOG(INFO) << "Close files";
     return close_err;
 }
 
@@ -5040,85 +4930,6 @@ std::tuple<uint64_t, std::string, KvError> CloudStoreMgr::ReadTermFile(
     return {term, download_task.etag_, KvError::NoError};
 }
 
-KvError CloudStoreMgr::CleanupLocalPartitionFiles(const TableIdent &tbl_id)
-{
-    namespace fs = std::filesystem;
-
-    const fs::path table_path =
-        tbl_id.StorePath(options_->store_path, options_->store_path_lut);
-    std::error_code ec;
-    if (!fs::exists(table_path, ec))
-    {
-        return ec ? ToKvError(-ec.value()) : KvError::NoError;
-    }
-
-    std::vector<std::string> cleanup_targets;
-    for (fs::directory_iterator it(table_path, ec), end; it != end;
-         it.increment(ec))
-    {
-        if (ec)
-        {
-            return ToKvError(-ec.value());
-        }
-        const fs::file_status status = it->status(ec);
-        if (ec)
-        {
-            return ToKvError(-ec.value());
-        }
-        if (!fs::is_regular_file(status))
-        {
-            continue;
-        }
-
-        const std::string filename = it->path().filename().string();
-        auto [prefix, suffix] = ParseFileName(filename);
-        static_cast<void>(suffix);
-        if (prefix == FileNameData)
-        {
-            cleanup_targets.push_back(filename);
-        }
-    }
-
-    CHECK(shard != nullptr);
-    bool empty_mapping = false;
-    RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
-    auto *entry = root_meta_mgr->Find(tbl_id);
-    if (entry != nullptr)
-    {
-        RootMeta &meta = entry->meta_;
-        empty_mapping = meta.mapper_ != nullptr && meta.root_id_ == MaxPageId &&
-                        meta.ttl_root_id_ == MaxPageId &&
-                        meta.mapper_->MappingCount() == 0;
-    }
-
-    if (empty_mapping)
-    {
-        const std::string manifest_name =
-            BranchManifestFileName(GetActiveBranch(), ProcessTerm());
-        const fs::path manifest_path = table_path / manifest_name;
-        if (fs::exists(manifest_path, ec) && !ec)
-        {
-            FileKey manifest_key{tbl_id, manifest_name};
-            if (!closed_files_.contains(manifest_key))
-            {
-                EnqueClosedFile(manifest_key);
-            }
-            cleanup_targets.push_back(manifest_name);
-        }
-    }
-
-    if (!cleanup_targets.empty())
-    {
-        ScheduleLocalFileCleanup(tbl_id, cleanup_targets);
-    }
-    else
-    {
-        return TryCleanupLocalPartitionDir(tbl_id);
-    }
-
-    return KvError::NoError;
-}
-
 void CloudStoreMgr::ScheduleLocalFileCleanup(
     const TableIdent &tbl_id, const std::vector<std::string> &filenames)
 {
@@ -5159,7 +4970,9 @@ void CloudStoreMgr::UnregisterDirBusy(const TableIdent &tbl_id)
     if (--it->second == 0)
     {
         dir_busy_counts_.erase(it);
-        if (!HasTrackedLocalFiles(tbl_id))
+        const bool pending_cleanup =
+            pending_busy_dir_cleanup_.erase(tbl_id) > 0;
+        if (pending_cleanup || !HasTrackedLocalFiles(tbl_id))
         {
             pending_dir_cleanup_.push_back(tbl_id);
             if (file_cleaner_.status_ == TaskStatus::Idle)
@@ -5260,8 +5073,6 @@ KvError CloudStoreMgr::SwitchManifest(const TableIdent &tbl_id,
 
 KvError IouringMgr::DropManifest(const TableIdent &tbl_id)
 {
-    // Do not check HasOtherFile: data files are expected to still be present;
-    // GC will clean them later.
     uint64_t process_term = ProcessTerm();
     auto [dir_fd, dir_err] =
         OpenFD(tbl_id, LruFD::kDirectory, false, "", 0);
