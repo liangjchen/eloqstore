@@ -402,6 +402,8 @@ set(ELOQ_STORE_SOURCES
         ${ROOT_FFI_DIR}/src/eloqstore_capi.cpp
         src/eloqstore_module.cpp
         src/file_gc.cpp
+        src/global_registered_memory.cpp
+        src/io_string_buffer.cpp
         src/kill_point.cpp
         src/kv_options.cpp
         src/replayer.cpp
