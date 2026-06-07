@@ -326,24 +326,23 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
             return false;
         }
 
-        uint64_t max_fd_limit = opts.local_space_limit / data_file_bytes;
-        if (max_fd_limit == 0)
+        uint64_t max_cached_files = opts.local_space_limit / data_file_bytes;
+        if (max_cached_files == 0)
         {
             opts.local_space_limit = data_file_bytes;
-            max_fd_limit = 1;
+            max_cached_files = 1;
             LOG(WARNING) << "local_space_limit is too small to hold one data "
                          << "file, bumping to " << opts.local_space_limit;
         }
 
-        size_t count_used_fd = utils::CountUsedFD();
-        if (opts.fd_limit > max_fd_limit + num_reserved_fd + count_used_fd)
+        uint64_t max_fd_limit = max_cached_files > 1 ? max_cached_files - 1 : 1;
+        if (opts.fd_limit > max_fd_limit)
         {
             LOG(WARNING) << "fd_limit * data_page_size * (1 << "
                             "pages_per_file_shift) exceeds local_space_limit, "
                          << "clamping fd_limit from " << opts.fd_limit << " to "
-                         << max_fd_limit + num_reserved_fd + count_used_fd;
-            opts.fd_limit = static_cast<uint32_t>(max_fd_limit) +
-                            num_reserved_fd + count_used_fd;
+                         << max_fd_limit;
+            opts.fd_limit = static_cast<uint32_t>(max_fd_limit);
         }
     }
     else if (opts.prewarm_cloud_cache)
