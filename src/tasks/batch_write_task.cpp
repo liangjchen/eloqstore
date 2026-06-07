@@ -1910,8 +1910,8 @@ KvError BatchWriteTask::Drop()
 
     // 3. Schedule async GC to clean up orphaned data files.  GC will find no
     //    manifest, treat all data files as unreferenced, delete them, and
-    //    remove the now-empty partition directory.
-    if (!shard->HasPendingLocalGc(tbl_ident_))
+    //    remove the now-empty partition directory.  GC requires append mode.
+    if (Options()->data_append_mode && !shard->HasPendingLocalGc(tbl_ident_))
     {
         shard->AddPendingLocalGc(tbl_ident_);
     }
