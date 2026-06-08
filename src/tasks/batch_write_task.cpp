@@ -8,6 +8,7 @@
 #include <span>
 #include <variant>
 
+#include "async_io_manager.h"
 #include "coding.h"
 #include "compression.h"
 #include "storage/shard.h"
@@ -1874,6 +1875,48 @@ KvError BatchWriteTask::Truncate(std::string_view trunc_pos)
     err = ApplyTTLBatch();
     CHECK_KV_ERR(err);
     return UpdateMeta();
+}
+
+KvError BatchWriteTask::Drop()
+{
+    // 1. Delete the manifest (local, and cloud copy in cloud mode).
+    KvError err = IoMgr()->DropManifest(tbl_ident_);
+    if (err != KvError::NoError)
+    {
+        LOG(ERROR) << "Drop: DropManifest failed for " << tbl_ident_.ToString()
+                   << ": " << ErrorString(err);
+        return err;
+    }
+
+    // 2. Clear the in-memory RootMeta.  The entry cannot be Erase'd here
+    //    because a concurrent read may hold a Handle (ref_cnt_ > 0) while
+    //    yielded on IO.  Instead we clear the fields; when the last reader
+    //    Unpins and ref_cnt_ reaches 0, RootMetaMgr will enqueue the entry
+    //    for deferred Erase.
+    RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
+    auto *entry = root_meta_mgr->Find(tbl_ident_);
+    if (entry != nullptr)
+    {
+        RootMeta &meta = entry->meta_;
+        meta.root_id_ = MaxPageId;
+        meta.ttl_root_id_ = MaxPageId;
+        meta.manifest_size_ = 0;
+        meta.next_expire_ts_ = 0;
+        meta.mapper_.reset();
+        meta.mapping_snapshots_.clear();
+        meta.compression_.reset();
+        root_meta_mgr->UpdateBytes(entry, 0);
+    }
+
+    // 3. Schedule async GC to clean up orphaned data files.  GC will find no
+    //    manifest, treat all data files as unreferenced, delete them, and
+    //    remove the now-empty partition directory.  GC requires append mode.
+    if (Options()->data_append_mode && !shard->HasPendingLocalGc(tbl_ident_))
+    {
+        shard->AddPendingLocalGc(tbl_ident_);
+    }
+
+    return KvError::NoError;
 }
 
 std::pair<bool, KvError> BatchWriteTask::TruncateDataPage(

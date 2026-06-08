@@ -1,11 +1,40 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 
 #include "common.h"
 #include "test_utils.h"
 
 using namespace test_util;
+
+namespace fs = std::filesystem;
+
+TEST_CASE("scan nonexistent partition", "[scan]")
+{
+    fs::path dir = fs::temp_directory_path() / fs::path("standby-test");
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    eloqstore::KvOptions opts;
+    opts.store_path = {dir.string()};
+
+    eloqstore::TableIdent tbl_id{"empty-scan", 0};
+
+    eloqstore::EloqStore store(opts);
+    REQUIRE(store.Start() == eloqstore::KvError::NoError);
+    eloqstore::ScanRequest scan_req;
+    std::string start_key = "0";
+    std::string end_key = "1";
+    scan_req.SetArgs(tbl_id, start_key, end_key);
+
+    store.ExecSync(&scan_req);
+    REQUIRE(scan_req.Error() == eloqstore::KvError::NotFound);
+
+    store.Stop();
+
+    fs::remove_all(dir);
+}
 
 TEST_CASE("delete scan", "[scan]")
 {

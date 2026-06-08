@@ -716,6 +716,17 @@ bool Shard::ProcessReq(KvRequest *req)
         StartTask(task, req, lbd);
         return true;
     }
+    case RequestType::Drop:
+    {
+        BatchWriteTask *task = task_mgr_.GetBatchWriteTask(req->TableId());
+        if (task == nullptr)
+        {
+            return false;
+        }
+        auto lbd = [task]() -> KvError { return task->Drop(); };
+        StartTask(task, req, lbd);
+        return true;
+    }
     case RequestType::DropTable:
     {
         LOG(ERROR) << "DropTable request routed to shard unexpectedly";

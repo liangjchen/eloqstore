@@ -213,6 +213,7 @@ private:
     PageManager *owner_;
     void EnqueueFront(Entry *entry);
     void Dequeue(Entry *entry);
+    void ProcessPendingErase();
 
     const KvOptions *options_;
     size_t capacity_bytes_{0};
@@ -220,6 +221,11 @@ private:
     std::unordered_map<TableIdent, Entry> entries_;
     Entry lru_head_{};
     Entry lru_tail_{};
+    // Entries that became empty (root_id==MaxPageId, mapper==null) while a
+    // reader held a Handle.  They are actually erased on the next Find or
+    // GetOrCreate call — the only safe time since no Handle can be live
+    // across those calls.
+    std::vector<TableIdent> pending_erase_;
 };
 
 struct CowRootMeta

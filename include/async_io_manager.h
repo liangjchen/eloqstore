@@ -403,7 +403,14 @@ public:
                    // implementations
     }
 
-    virtual KvError CleanManifest(const TableIdent &tbl_id) = 0;
+    /**
+     * @brief Drop a partition's manifest — delete it from local disk (and cloud
+     *        storage in cloud mode). This does NOT check HasOtherFile, because
+     *        it is called from Drop / Reopen-clean paths where data files are
+     *        expected to still be present and will be cleaned by GC later.
+     */
+    virtual KvError DropManifest(const TableIdent &tbl_id) = 0;
+
     virtual void RegisterDirBusy(const TableIdent &tbl_id)
     {
         (void) tbl_id;
@@ -650,13 +657,7 @@ public:
     }
 
     virtual KvError TryCleanupLocalPartitionDir(const TableIdent &tbl_id);
-    // Remove all files under the partition directory and then the directory
-    // itself. Used by reopen paths that install an empty snapshot, where the
-    // local files (left over from a previous primary or earlier generation)
-    // no longer belong to the current in-memory mapping. CloudStoreMgr
-    // overrides this to coordinate with its tracked-file state.
-    virtual KvError CleanupLocalPartitionFiles(const TableIdent &tbl_id);
-    KvError CleanManifest(const TableIdent &tbl_id) override;
+    KvError DropManifest(const TableIdent &tbl_id) override;
 
     static constexpr uint64_t oflags_dir = O_DIRECTORY | O_RDONLY;
 
@@ -697,7 +698,7 @@ public:
         static constexpr TypedFileId kManifest{MaxFileId - 1};
         // Largest raw FileId that can encode to a non-sentinel TypedFileId.
         // DataFileKey/SegmentFileKey shift left by 1, so any FileId
-        // <= kMaxDataFile yields an encoded value < kMaxReserved.
+        // <= kMaxDataFile yields an encoded value < kMinReserved.
         static constexpr FileId kMaxDataFile = (MaxFileId - 1) >> 1;
 
         static constexpr int FdEmpty = -1;
@@ -1154,7 +1155,7 @@ public:
                               std::string_view branch_name,
                               uint64_t term) override;
     KvError AbortWrite(const TableIdent &tbl_id) override;
-    KvError CleanManifest(const TableIdent &tbl_id) override;
+    KvError DropManifest(const TableIdent &tbl_id) override;
 
     ObjectStore &GetObjectStore()
     {
@@ -1274,7 +1275,6 @@ public:
     std::pair<ManifestFilePtr, KvError> RefreshManifest(
         const TableIdent &tbl_id, std::string_view archive_tag);
     KvError TryCleanupLocalPartitionDir(const TableIdent &tbl_id) override;
-    KvError CleanupLocalPartitionFiles(const TableIdent &tbl_id) override;
     void ScheduleLocalFileCleanup(const TableIdent &tbl_id,
                                   const std::vector<std::string> &filenames);
     void RegisterDirBusy(const TableIdent &tbl_id) override;
@@ -1452,6 +1452,7 @@ private:
     std::unordered_set<FileKey> pending_gc_cleanup_;
     std::unordered_map<TableIdent, size_t> closed_file_counts_;
     std::deque<TableIdent> pending_dir_cleanup_;
+    std::unordered_set<TableIdent> pending_busy_dir_cleanup_;
     std::unordered_map<TableIdent, uint32_t> dir_busy_counts_;
     CachedFile lru_file_head_;
     CachedFile lru_file_tail_;
@@ -1611,7 +1612,7 @@ public:
         return 0;  // MemStoreMgr doesn't use local file caching
     }
 
-    KvError CleanManifest(const TableIdent &tbl_id) override;
+    KvError DropManifest(const TableIdent &tbl_id) override;
 
     class Manifest : public ManifestFile
     {

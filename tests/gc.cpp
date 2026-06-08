@@ -146,8 +146,7 @@ bool WaitForCondition(std::chrono::milliseconds timeout,
 }
 }  // namespace
 
-TEST_CASE("local mode truncate removes local partition directory",
-          "[gc][local]")
+TEST_CASE("local mode drop removes local partition directory", "[gc][local]")
 {
     CleanupStore(local_gc_opts);
 
@@ -160,35 +159,15 @@ TEST_CASE("local mode truncate removes local partition directory",
     tester.Validate();
     REQUIRE(CheckLocalPartitionExists(local_gc_opts, tbl_id));
 
-    tester.Truncate(0, true);
+    eloqstore::DropRequest drop_req;
+    drop_req.SetArgs(tbl_id);
+    store->ExecSync(&drop_req);
+    REQUIRE(drop_req.Error() == eloqstore::KvError::NoError);
 
     REQUIRE(WaitForCondition(
         3s,
         20ms,
         [&]() { return !CheckLocalPartitionExists(local_gc_opts, tbl_id); }));
-
-    store->Stop();
-    CleanupStore(local_gc_opts);
-}
-
-TEST_CASE("local mode truncate removes local partition directory after wait",
-          "[gc][local]")
-{
-    CleanupStore(local_gc_opts);
-
-    eloqstore::EloqStore *store = InitStore(local_gc_opts);
-    eloqstore::TableIdent tbl_id = {"gc_local_dir_cleanup", 1};
-    MapVerifier tester(tbl_id, store, false);
-    tester.SetValueSize(1000);
-
-    tester.Upsert(0, 100);
-    tester.Validate();
-    REQUIRE(CheckLocalPartitionExists(local_gc_opts, tbl_id));
-
-    tester.Truncate(0, true);
-    WaitForGC(2);
-
-    REQUIRE_FALSE(CheckLocalPartitionExists(local_gc_opts, tbl_id));
 
     store->Stop();
     CleanupStore(local_gc_opts);
@@ -419,16 +398,16 @@ TEST_CASE("cloud mode repeated truncate with directory purge", "[gc][cloud]")
 //   2. The boundary math: with the boundary set to the current allocator
 //      high-water mark, the active (boundary) data file is protected even
 //      when something else triggers a GC pass.
-//   3. The cleanup path: once the in-memory mapping is empty, GC + the
-//      empty-snapshot cleanup actually delete every data file and remove
-//      the partition directory.
+//   3. The cleanup path: once the in-memory mapping is empty, GC deletes
+//      data files while truncate keeps the manifest/partition. A subsequent
+//      DropRequest removes the manifest and partition directory.
 //
 // If `first_unflushed_fp_id_` stops propagating from `CowRootMeta` to
 // `RootMeta`, or `SeedActiveBranchGuardFromInMemory` miscomputes
 // `least_unflushed_file_id_`, or the retention check flips back to a strict
 // `>` without the boundary including the active file, this test fails
-// either at the "in-flight file preserved" assertion or at the post-truncate
-// directory-removed assertion.
+// either at the "in-flight file preserved" assertion, the post-truncate
+// manifest-preserved assertion, or the post-drop directory-removed assertion.
 TEST_CASE("local GC honors in-memory least_unflushed boundary",
           "[gc][local][boundary]")
 {
@@ -460,6 +439,17 @@ TEST_CASE("local GC honors in-memory least_unflushed boundary",
         }
         return n;
     };
+    auto has_manifest_file = [&]()
+    {
+        for (const std::string &name : ListLocalPartitionFiles(opts, tbl_id))
+        {
+            if (name.rfind("manifest_", 0) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
     const size_t initial_count = count_data_files();
     REQUIRE(initial_count >= 2);
 
@@ -481,11 +471,21 @@ TEST_CASE("local GC honors in-memory least_unflushed boundary",
     // Validate data is still readable after the second flush + GC.
     tester.Validate();
 
-    // Final assertion: once the in-memory mapping is emptied by Truncate,
-    // every data file becomes unreferenced and the partition directory
-    // disappears. This pins the cleanup path that ExecuteLocalGC's
-    // empty-data-files branch drives.
+    // Once the in-memory mapping is emptied by Truncate, every data file
+    // becomes unreferenced, but truncate keeps the manifest so the partition
+    // directory remains.
     tester.Truncate(0, true);
+    REQUIRE(
+        WaitForCondition(5s, 50ms, [&]() { return count_data_files() == 0; }));
+    REQUIRE(CheckLocalPartitionExists(opts, tbl_id));
+    REQUIRE(has_manifest_file());
+
+    // Drop removes the manifest as well, allowing partition cleanup to remove
+    // the now-empty directory.
+    eloqstore::DropRequest drop_req;
+    drop_req.SetArgs(tbl_id);
+    store->ExecSync(&drop_req);
+    REQUIRE(drop_req.Error() == eloqstore::KvError::NoError);
     REQUIRE(WaitForCondition(
         5s, 50ms, [&]() { return !CheckLocalPartitionExists(opts, tbl_id); }));
 

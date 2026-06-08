@@ -262,12 +262,12 @@ struct TypedFileId
 
     bool IsSegmentFile() const
     {
-        return value_ < kMaxReserved && (value_ & 1) != 0;
+        return value_ < kMinReserved && (value_ & 1) != 0;
     }
 
     bool IsDataFile() const
     {
-        return value_ < kMaxReserved && (value_ & 1) == 0;
+        return value_ < kMinReserved && (value_ & 1) == 0;
     }
 
     /**
@@ -280,11 +280,11 @@ struct TypedFileId
 
     std::string ToString() const
     {
-        if (value_ == kMaxReserved)
+        if (value_ == kMinReserved)
         {
             return "Manifest";
         }
-        else if (value_ == kMaxReserved - 1)
+        else if (value_ == kMinReserved + 1)
         {
             return "Directory";
         }
@@ -308,7 +308,7 @@ struct TypedFileId
         return H::combine(std::move(h), id.value_);
     }
 
-    static constexpr uint64_t kMaxReserved = MaxFileId - 1;
+    static constexpr uint64_t kMinReserved = MaxFileId - 1;
 };
 
 // Heterogeneous less-than for std::lower_bound against a TypedFileId.

@@ -153,7 +153,7 @@ TEST_CASE("drop table clears all partitions", "[persist][droptable]")
                     base_key + static_cast<uint32_t>(kNumKeysPerPartition));
                 scan_req.SetArgs(table_ident(partition), begin_key, end_key);
                 store->ExecSync(&scan_req);
-                REQUIRE(scan_req.Error() == eloqstore::KvError::NoError);
+                REQUIRE(scan_req.Error() == eloqstore::KvError::NotFound);
                 REQUIRE(scan_req.Entries().empty());
 
                 for (const auto &key : expected_keys[idx])

@@ -241,6 +241,8 @@ private:
             return "batch_write";
         case RequestType::Truncate:
             return "truncate";
+        case RequestType::Drop:
+            return "drop";
         case RequestType::DropTable:
             return "drop_table";
         case RequestType::Archive:
