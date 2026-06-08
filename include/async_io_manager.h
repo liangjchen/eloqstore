@@ -697,9 +697,14 @@ public:
         static constexpr TypedFileId kDirectory{MaxFileId};
         static constexpr TypedFileId kManifest{MaxFileId - 1};
         // Largest raw FileId that can encode to a non-sentinel TypedFileId.
-        // DataFileKey/SegmentFileKey shift left by 1, so any FileId
-        // <= kMaxDataFile yields an encoded value < kMinReserved.
-        static constexpr FileId kMaxDataFile = (MaxFileId - 1) >> 1;
+        // DataFileKey/SegmentFileKey shift left by 1 (SegmentFileKey also sets
+        // the LSB), so both encodings of any FileId <= kMaxDataFile stay
+        // strictly below kManifest (MaxFileId - 1):
+        //   DataFileKey(kMaxDataFile)    = MaxFileId - 3
+        //   SegmentFileKey(kMaxDataFile) = MaxFileId - 2
+        // SegmentFileKey is the binding constraint (it's the larger of the two
+        // by 1), so this is the largest value for which both hold.
+        static constexpr FileId kMaxDataFile = (MaxFileId >> 1) - 1;
 
         static constexpr int FdEmpty = -1;
 
