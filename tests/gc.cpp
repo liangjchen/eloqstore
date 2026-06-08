@@ -475,8 +475,8 @@ TEST_CASE("local GC honors in-memory least_unflushed boundary",
     // becomes unreferenced, but truncate keeps the manifest so the partition
     // directory remains.
     tester.Truncate(0, true);
-    REQUIRE(WaitForCondition(
-        5s, 50ms, [&]() { return count_data_files() == 0; }));
+    REQUIRE(
+        WaitForCondition(5s, 50ms, [&]() { return count_data_files() == 0; }));
     REQUIRE(CheckLocalPartitionExists(opts, tbl_id));
     REQUIRE(has_manifest_file());
 

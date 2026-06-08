@@ -5074,8 +5074,7 @@ KvError CloudStoreMgr::SwitchManifest(const TableIdent &tbl_id,
 KvError IouringMgr::DropManifest(const TableIdent &tbl_id)
 {
     uint64_t process_term = ProcessTerm();
-    auto [dir_fd, dir_err] =
-        OpenFD(tbl_id, LruFD::kDirectory, false, "", 0);
+    auto [dir_fd, dir_err] = OpenFD(tbl_id, LruFD::kDirectory, false, "", 0);
     if (dir_err == KvError::NoError)
     {
         const std::string manifest_name =
@@ -5090,8 +5089,7 @@ KvError IouringMgr::DropManifest(const TableIdent &tbl_id)
         if (close_err != KvError::NoError)
         {
             LOG(WARNING) << "DropManifest: failed to close dir for "
-                         << tbl_id.ToString() << ": "
-                         << ErrorString(close_err);
+                         << tbl_id.ToString() << ": " << ErrorString(close_err);
         }
     }
     else if (dir_err != KvError::NotFound)
@@ -5135,8 +5133,7 @@ KvError CloudStoreMgr::DropManifest(const TableIdent &tbl_id)
         delete_task.error_ != KvError::NotFound)
     {
         LOG(WARNING) << "DropManifest: failed to delete cloud manifest "
-                     << remote_path << ": "
-                     << ErrorString(delete_task.error_);
+                     << remote_path << ": " << ErrorString(delete_task.error_);
     }
 
     return KvError::NoError;

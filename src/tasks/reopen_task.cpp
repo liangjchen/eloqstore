@@ -66,13 +66,12 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
         err = shard->IoManager()->DropManifest(tbl_id);
         if (err != KvError::NoError)
         {
-            LOG(ERROR) << "Reopen " << tbl_id
-                       << " DropManifest failed, tag " << request->Tag()
-                       << ", error " << static_cast<uint32_t>(err);
+            LOG(ERROR) << "Reopen " << tbl_id << " DropManifest failed, tag "
+                       << request->Tag() << ", error "
+                       << static_cast<uint32_t>(err);
             return err;
         }
-        RootMetaMgr *root_meta_mgr =
-            shard->IndexManager()->RootMetaManager();
+        RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
         auto *entry = root_meta_mgr->Find(tbl_id);
         if (entry != nullptr)
         {

@@ -192,8 +192,7 @@ void MappingSnapshot::MappingTbl::CopyFrom(const MappingTbl &src)
             uint64_t &val = (*base_[chunk_idx])[i];
             if (MappingSnapshot::IsSwizzlingPointer(val))
             {
-                MemCachedPage *page =
-                    reinterpret_cast<MemCachedPage *>(val);
+                MemCachedPage *page = reinterpret_cast<MemCachedPage *>(val);
                 if (page->IsDetached())
                 {
                     val = MappingSnapshot::EncodeFilePageId(

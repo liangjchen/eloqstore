@@ -1150,8 +1150,7 @@ KvError DeleteUnreferencedLocalFiles(
         {
             static_cast<CloudStoreMgr *>(io_mgr)->ScheduleLocalFileCleanup(
                 tbl_id, filenames_to_delete);
-            DLOG(INFO) << "ExecuteLocalGC: scheduled "
-                       << files_to_delete.size()
+            DLOG(INFO) << "ExecuteLocalGC: scheduled " << files_to_delete.size()
                        << " unreferenced files for local cache cleanup";
         }
         else

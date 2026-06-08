@@ -4,6 +4,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -775,8 +776,7 @@ KvError EloqStore::Start(std::string_view branch,
     }
     else
     {
-        LOG(WARNING) << "Failed to get RLIMIT_NOFILE: "
-                     << std::strerror(errno)
+        LOG(WARNING) << "Failed to get RLIMIT_NOFILE: " << std::strerror(errno)
                      << ", using configured fd_limit without process clamp";
     }
 
@@ -785,8 +785,7 @@ KvError EloqStore::Start(std::string_view branch,
     if (store_fd_limit < options_.fd_limit)
     {
         LOG(WARNING) << "Clamp store fd limit from " << options_.fd_limit
-                     << " to " << store_fd_limit
-                     << ", used_fd=" << used_fd
+                     << " to " << store_fd_limit << ", used_fd=" << used_fd
                      << ", reserved_fd=" << num_reserved_fd;
     }
 
@@ -806,8 +805,7 @@ KvError EloqStore::Start(std::string_view branch,
             static_cast<uint32_t>(store_fd_limit / options_.num_threads);
     }
     LOG(INFO) << "Calculate shard fd limit: fd_limit=" << options_.fd_limit
-              << ", used_fd=" << used_fd
-              << ", reserved_fd=" << num_reserved_fd
+              << ", used_fd=" << used_fd << ", reserved_fd=" << num_reserved_fd
               << ", available_fd=" << available_fd
               << ", store_fd_limit=" << store_fd_limit
               << ", num_threads=" << options_.num_threads

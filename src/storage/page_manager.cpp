@@ -553,8 +553,8 @@ KvError PageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
             if (drop_err != KvError::NoError)
             {
                 LOG(WARNING) << "InstallExternalSnapshot DropManifest failed "
-                             << "for table " << tbl_ident
-                             << ", error " << static_cast<uint32_t>(drop_err);
+                             << "for table " << tbl_ident << ", error "
+                             << static_cast<uint32_t>(drop_err);
             }
 
             auto [entry, inserted] = RootMetaManager()->GetOrCreate(tbl_ident);

@@ -1883,8 +1883,8 @@ KvError BatchWriteTask::Drop()
     KvError err = IoMgr()->DropManifest(tbl_ident_);
     if (err != KvError::NoError)
     {
-        LOG(ERROR) << "Drop: DropManifest failed for "
-                   << tbl_ident_.ToString() << ": " << ErrorString(err);
+        LOG(ERROR) << "Drop: DropManifest failed for " << tbl_ident_.ToString()
+                   << ": " << ErrorString(err);
         return err;
     }
 
