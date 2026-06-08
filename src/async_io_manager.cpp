@@ -1258,7 +1258,7 @@ KvError IouringMgr::SubmitMergedWrite(const TableIdent &tbl_id,
     // applies to actual data/segment files, not the manifest sentinel.
     const bool skip_cloud_lookup =
         options_->data_append_mode && !options_->cloud_store_path.empty() &&
-        file_id.value_ < TypedFileId::kMaxReserved && offset == 0;
+        file_id.value_ < TypedFileId::kMinReserved && offset == 0;
     OnFileRangeWritePrepared(tbl_id,
                              file_id,
                              branch,
@@ -1716,7 +1716,7 @@ std::pair<IouringMgr::LruFD::Ref, KvError> IouringMgr::OpenOrCreateFD(
         {
             // This must be data or segment file because manifest should
             // always be created by call WriteSnapshot.
-            assert(file_id.value_ < TypedFileId::kMaxReserved);
+            assert(file_id.value_ < TypedFileId::kMinReserved);
             auto [dfd_ref, err] =
                 OpenOrCreateFD(tbl_id, LruFD::kDirectory, false, true, "", 0);
             error = err;
@@ -2096,7 +2096,7 @@ int IouringMgr::CreateFile(LruFD::Ref dir_fd,
                            std::string_view branch_name,
                            uint64_t term)
 {
-    assert(file_id.value_ < TypedFileId::kMaxReserved);
+    assert(file_id.value_ < TypedFileId::kMinReserved);
     uint64_t flags = O_CREAT | O_RDWR | O_DIRECT;
     FileId real_id = file_id.ToFileId();
     std::string filename = file_id.IsSegmentFile()
@@ -2144,7 +2144,7 @@ int IouringMgr::OpenFile(const TableIdent &tbl_id,
     {
         // Data/segment file is always opened with O_DIRECT.
         assert((flags & O_DIRECT) == O_DIRECT);
-        assert(file_id.value_ < TypedFileId::kMaxReserved);
+        assert(file_id.value_ < TypedFileId::kMinReserved);
         FileId real_id = file_id.ToFileId();
         if (file_id.IsSegmentFile())
         {
@@ -5673,7 +5673,7 @@ size_t CloudStoreMgr::EstimateFileSize(TypedFileId file_id) const
     }
     else
     {
-        assert(file_id.value_ < TypedFileId::kMaxReserved);
+        assert(file_id.value_ < TypedFileId::kMinReserved);
         return options_->DataFileSize();
     }
 }

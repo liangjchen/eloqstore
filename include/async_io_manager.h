@@ -698,7 +698,7 @@ public:
         static constexpr TypedFileId kManifest{MaxFileId - 1};
         // Largest raw FileId that can encode to a non-sentinel TypedFileId.
         // DataFileKey/SegmentFileKey shift left by 1, so any FileId
-        // <= kMaxDataFile yields an encoded value < kMaxReserved.
+        // <= kMaxDataFile yields an encoded value < kMinReserved.
         static constexpr FileId kMaxDataFile = (MaxFileId - 1) >> 1;
 
         static constexpr int FdEmpty = -1;
