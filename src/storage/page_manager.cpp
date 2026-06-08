@@ -752,7 +752,7 @@ void PageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
 
 void PageManager::TryRecycleCachedPage(MemCachedPage *page)
 {
-    if (page == nullptr || page->IsPinned())
+    if (page == nullptr || page->IsPinned() || page->IsDetached())
     {
         return;
     }

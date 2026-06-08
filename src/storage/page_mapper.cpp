@@ -181,6 +181,26 @@ void MappingSnapshot::MappingTbl::CopyFrom(const MappingTbl &src)
         std::memcpy(base_[chunk_idx]->data(),
                     src.base_[chunk_idx]->data(),
                     copy_elems * sizeof(uint64_t));
+        // Swizzling pointers to pages still being loaded (detached)
+        // are unsafe to share across mapping copies: if the loading
+        // task fails, the original unswizzles but the copy is left
+        // with a dangling pointer. Convert detached swizzled pages
+        // back to their file_page_id so the copy never holds a
+        // pointer into an incomplete load window.
+        for (size_t i = 0; i < copy_elems; ++i)
+        {
+            uint64_t &val = (*base_[chunk_idx])[i];
+            if (MappingSnapshot::IsSwizzlingPointer(val))
+            {
+                MemCachedPage *page =
+                    reinterpret_cast<MemCachedPage *>(val);
+                if (page->IsDetached())
+                {
+                    val = MappingSnapshot::EncodeFilePageId(
+                        page->GetFilePageId());
+                }
+            }
+        }
         ThdTask()->YieldToLowPQ();
     }
 }
