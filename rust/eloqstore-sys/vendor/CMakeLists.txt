@@ -402,6 +402,8 @@ set(ELOQ_STORE_SOURCES
         ${ROOT_FFI_DIR}/src/eloqstore_capi.cpp
         src/eloqstore_module.cpp
         src/file_gc.cpp
+        src/global_registered_memory.cpp
+        src/io_string_buffer.cpp
         src/kill_point.cpp
         src/kv_options.cpp
         src/replayer.cpp
@@ -409,8 +411,8 @@ set(ELOQ_STORE_SOURCES
         src/storage/data_page.cpp
         src/storage/data_page_builder.cpp
         src/storage/index_page_builder.cpp
-        src/storage/index_page_manager.cpp
-        src/storage/mem_index_page.cpp
+        src/storage/page_manager.cpp
+        src/storage/mem_cached_page.cpp
         src/storage/object_store.cpp
         src/storage/page.cpp
         src/storage/page_mapper.cpp

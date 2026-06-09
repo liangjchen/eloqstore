@@ -30,6 +30,7 @@
 #include "cloud_storage_service.h"
 #include "common.h"
 #include "file_gc.h"
+#include "global_registered_memory.h"
 #include "standby_service.h"
 #include "storage/shard.h"
 #include "tasks/archive_crond.h"
@@ -144,6 +145,16 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
     if ((opts.data_page_size & (page_align - 1)) != 0)
     {
         LOG(ERROR) << "Option data_page_size is not page aligned";
+        return false;
+    }
+    // segment_size: must be page-aligned. Enforced here so release builds
+    // fail loud at startup instead of relying on the debug-only assertion
+    // in the GlobalRegisteredMemory constructor.
+    if (opts.segment_size == 0 || (opts.segment_size & (page_align - 1)) != 0)
+    {
+        LOG(ERROR) << "Option segment_size (" << opts.segment_size
+                   << ") must be non-zero and " << page_align
+                   << "-byte aligned";
         return false;
     }
     if ((opts.coroutine_stack_size & (page_align - 1)) != 0)
@@ -316,24 +327,23 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
             return false;
         }
 
-        uint64_t max_fd_limit = opts.local_space_limit / data_file_bytes;
-        if (max_fd_limit == 0)
+        uint64_t max_cached_files = opts.local_space_limit / data_file_bytes;
+        if (max_cached_files == 0)
         {
             opts.local_space_limit = data_file_bytes;
-            max_fd_limit = 1;
+            max_cached_files = 1;
             LOG(WARNING) << "local_space_limit is too small to hold one data "
                          << "file, bumping to " << opts.local_space_limit;
         }
 
-        size_t count_used_fd = utils::CountUsedFD();
-        if (opts.fd_limit > max_fd_limit + num_reserved_fd + count_used_fd)
+        uint64_t max_fd_limit = max_cached_files > 1 ? max_cached_files - 1 : 1;
+        if (opts.fd_limit > max_fd_limit)
         {
             LOG(WARNING) << "fd_limit * data_page_size * (1 << "
                             "pages_per_file_shift) exceeds local_space_limit, "
                          << "clamping fd_limit from " << opts.fd_limit << " to "
-                         << max_fd_limit + num_reserved_fd + count_used_fd;
-            opts.fd_limit = static_cast<uint32_t>(max_fd_limit) +
-                            num_reserved_fd + count_used_fd;
+                         << max_fd_limit;
+            opts.fd_limit = static_cast<uint32_t>(max_fd_limit);
         }
     }
     else if (opts.prewarm_cloud_cache)
@@ -342,6 +352,82 @@ bool EloqStore::ValidateOptions(KvOptions &opts)
             << "prewarm_cloud_cache requires cloud_store_path to be set, "
                "disabling prewarm";
         opts.prewarm_cloud_cache = false;
+    }
+
+    if (!opts.global_registered_memories.empty())
+    {
+        if (opts.global_registered_memories.size() != opts.num_threads)
+        {
+            LOG(ERROR) << "global_registered_memories size ("
+                       << opts.global_registered_memories.size()
+                       << ") must equal num_threads (" << opts.num_threads
+                       << ")";
+            return false;
+        }
+        for (GlobalRegisteredMemory *mem : opts.global_registered_memories)
+        {
+            if (mem == nullptr)
+            {
+                LOG(ERROR) << "global_registered_memories contains a null "
+                              "pointer";
+                return false;
+            }
+        }
+        if (!opts.pinned_memory_chunks.empty())
+        {
+            LOG(ERROR) << "global_registered_memories and pinned_memory_chunks "
+                          "are mutually exclusive; only one mode may be set";
+            return false;
+        }
+    }
+
+    if (!opts.pinned_memory_chunks.empty())
+    {
+        constexpr size_t kPinnedAlign = 4096;
+        for (const auto &chunk : opts.pinned_memory_chunks)
+        {
+            if (chunk.first == nullptr || chunk.second == 0)
+            {
+                LOG(ERROR) << "pinned_memory_chunks contains a null/zero-size "
+                              "chunk";
+                return false;
+            }
+            if (reinterpret_cast<uintptr_t>(chunk.first) % kPinnedAlign != 0 ||
+                chunk.second % kPinnedAlign != 0)
+            {
+                LOG(ERROR)
+                    << "pinned_memory_chunks must be 4 KiB aligned (base "
+                       "and size)";
+                return false;
+            }
+        }
+        const size_t min_gc_pool =
+            static_cast<size_t>(max_segments_batch) * opts.segment_size;
+        if (opts.gc_global_mem_size_per_shard < min_gc_pool)
+        {
+            LOG(ERROR) << "gc_global_mem_size_per_shard ("
+                       << opts.gc_global_mem_size_per_shard
+                       << ") must be at least max_segments_batch * "
+                          "segment_size ("
+                       << min_gc_pool << ")";
+            return false;
+        }
+        if (opts.gc_global_mem_size_per_shard % opts.segment_size != 0)
+        {
+            LOG(ERROR) << "gc_global_mem_size_per_shard ("
+                       << opts.gc_global_mem_size_per_shard
+                       << ") must be a multiple of segment_size ("
+                       << opts.segment_size << ")";
+            return false;
+        }
+        // tail-scratch knob is unbounded above; only sanity-check that a
+        // 0-slot pool is the caller's explicit "fail if cross-chunk" choice.
+        if (opts.pinned_tail_scratch_slots == 0)
+        {
+            LOG(WARNING) << "pinned_tail_scratch_slots is 0; pinned writes "
+                            "with non-segment-aligned size that end at a "
+                            "chunk boundary will fail with InvalidArgs";
+        }
     }
 
     if (opts.data_append_mode)
@@ -470,8 +556,6 @@ void EloqStore::CleanupRuntime(size_t started_shards)
 {
     const size_t shard_count = std::min(started_shards, shards_.size());
 
-    DLOG(INFO) << "EloqStore::CleanupRuntime stage=begin"
-               << ", started_shards=" << shard_count;
     for (size_t i = 0; i < shard_count; ++i)
     {
         if (shards_[i] != nullptr)
@@ -481,19 +565,15 @@ void EloqStore::CleanupRuntime(size_t started_shards)
     }
     if (prewarm_service_ != nullptr)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_prewarm";
         prewarm_service_->Stop();
     }
     if (archive_crond_ != nullptr)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_archive_crond";
         archive_crond_->Stop();
     }
 #ifdef ELOQ_MODULE_ENABLED
     if (module_ != nullptr)
     {
-        DLOG(INFO)
-            << "EloqStore::CleanupRuntime stage=signal_module_workers_stop";
         for (size_t i = 0; i < shard_count; ++i)
         {
             if (shards_[i] != nullptr)
@@ -504,8 +584,6 @@ void EloqStore::CleanupRuntime(size_t started_shards)
                     static_cast<int>(shards_[i]->shard_id_));
             }
         }
-        DLOG(INFO)
-            << "EloqStore::CleanupRuntime stage=wait_module_workers_stop";
         while (true)
         {
             bool all_stopped = true;
@@ -525,12 +603,10 @@ void EloqStore::CleanupRuntime(size_t started_shards)
             }
             bthread_usleep(1000);
         }
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=unregister_module";
         eloq::unregister_module(module_.get());
     }
 #endif
 
-    DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_shards";
     for (size_t i = 0; i < shard_count; ++i)
     {
         if (shards_[i] != nullptr)
@@ -539,7 +615,6 @@ void EloqStore::CleanupRuntime(size_t started_shards)
         }
     }
 
-    DLOG(INFO) << "EloqStore::CleanupRuntime stage=clear_resources";
     shards_.clear();
 
     for (int fd : root_fds_)
@@ -552,12 +627,10 @@ void EloqStore::CleanupRuntime(size_t started_shards)
     // can finish.
     if (standby_service_)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_standby_service";
         standby_service_->Stop();
     }
     if (cloud_service_)
     {
-        DLOG(INFO) << "EloqStore::CleanupRuntime stage=stop_cloud_service";
         cloud_service_->Stop();
     }
     if (eloq_store == this)
@@ -665,10 +738,7 @@ KvError EloqStore::Start(std::string_view branch,
     // Initialize
     if (!options_.store_path.empty())
     {
-        DLOG(INFO) << "EloqStore::Start stage=init_store_space_begin";
         KvError err = InitStoreSpace();
-        DLOG(INFO) << "EloqStore::Start stage=init_store_space_end err="
-                   << ErrorString(err);
         if (err != KvError::NoError)
         {
             return fail_start(err);
@@ -680,27 +750,75 @@ KvError EloqStore::Start(std::string_view branch,
     partition_group_id_ = mode == StoreMode::Cloud ? partition_group_id : 0;
     branch_ = std::string(branch);
 
-    // There are files opened at very early stage like stdin/stdout/stderr, glog
-    // file, and root directories of data.
+    // EloqStore runs as a library and shares the process fd table with the
+    // embedding application. Treat fd_limit as the store's desired fd slot
+    // budget, then clamp it to the process fd headroom.
     uint32_t shard_fd_limit = 0;
     size_t used_fd = utils::CountUsedFD();
-    if (used_fd + num_reserved_fd < options_.fd_limit)
+
+    uint64_t available_fd = std::numeric_limits<uint64_t>::max();
+    struct rlimit fd_rlimit;
+    if (getrlimit(RLIMIT_NOFILE, &fd_rlimit) == 0)
     {
-        shard_fd_limit = (options_.fd_limit - used_fd - num_reserved_fd) /
-                         options_.num_threads;
+        if (fd_rlimit.rlim_cur != RLIM_INFINITY)
+        {
+            uint64_t process_fd_limit =
+                static_cast<uint64_t>(fd_rlimit.rlim_cur);
+            if (process_fd_limit > used_fd + num_reserved_fd)
+            {
+                available_fd = process_fd_limit - used_fd - num_reserved_fd;
+            }
+            else
+            {
+                available_fd = 0;
+            }
+        }
     }
+    else
+    {
+        LOG(WARNING) << "Failed to get RLIMIT_NOFILE: " << std::strerror(errno)
+                     << ", using configured fd_limit without process clamp";
+    }
+
+    uint64_t store_fd_limit =
+        std::min<uint64_t>(options_.fd_limit, available_fd);
+    if (store_fd_limit < options_.fd_limit)
+    {
+        LOG(WARNING) << "Clamp store fd limit from " << options_.fd_limit
+                     << " to " << store_fd_limit << ", used_fd=" << used_fd
+                     << ", reserved_fd=" << num_reserved_fd;
+    }
+
+    if (!options_.store_path.empty() && store_fd_limit < options_.num_threads)
+    {
+        LOG(ERROR) << "Insufficient fd budget for EloqStore: fd_limit="
+                   << options_.fd_limit << ", available_fd=" << available_fd
+                   << ", used_fd=" << used_fd
+                   << ", reserved_fd=" << num_reserved_fd
+                   << ", num_threads=" << options_.num_threads;
+        return fail_start(KvError::OpenFileLimit);
+    }
+
+    if (options_.num_threads > 0)
+    {
+        shard_fd_limit =
+            static_cast<uint32_t>(store_fd_limit / options_.num_threads);
+    }
+    LOG(INFO) << "Calculate shard fd limit: fd_limit=" << options_.fd_limit
+              << ", used_fd=" << used_fd << ", reserved_fd=" << num_reserved_fd
+              << ", available_fd=" << available_fd
+              << ", store_fd_limit=" << store_fd_limit
+              << ", num_threads=" << options_.num_threads
+              << ", shard_fd_limit=" << shard_fd_limit;
 
     shards_.resize(options_.num_threads);
     for (size_t i = 0; i < options_.num_threads; i++)
     {
-        DLOG(INFO) << "EloqStore::Start stage=shard_init_begin shard=" << i;
         if (shards_[i] == nullptr)
         {
             shards_[i] = std::make_unique<Shard>(this, i, shard_fd_limit);
         }
         KvError err = shards_[i]->Init();
-        DLOG(INFO) << "EloqStore::Start stage=shard_init_end shard=" << i
-                   << ", err=" << ErrorString(err);
         if (err != KvError::NoError)
         {
             return fail_start(err);
@@ -709,15 +827,8 @@ KvError EloqStore::Start(std::string_view branch,
 
     if (cloud_service_)
     {
-        DLOG(INFO) << "EloqStore::Start stage=sync_current_term_begin";
-        DLOG(INFO) << "EloqStore::Start stage=cloud_service_start_begin";
         cloud_service_->Start();
-        DLOG(INFO) << "EloqStore::Start stage=cloud_service_start_end";
-
-        DLOG(INFO) << "EloqStore::Start stage=sync_current_term_wait";
         cloud_service_->bootstrap_state_.Wait();
-        DLOG(INFO) << "EloqStore::Start stage=sync_current_term_done err="
-                   << ErrorString(cloud_service_->bootstrap_state_.err_);
         if (cloud_service_->bootstrap_state_.err_ != KvError::NoError)
         {
             return fail_start(cloud_service_->bootstrap_state_.err_);
@@ -725,29 +836,23 @@ KvError EloqStore::Start(std::string_view branch,
     }
     else if (standby_service_)
     {
-        DLOG(INFO) << "EloqStore::Start stage=standby_service_start_begin";
         standby_service_->Start();
-        DLOG(INFO) << "EloqStore::Start stage=standby_service_start_end";
     }
 
     // Start threads.
     for (size_t i = 0; i < shards_.size(); ++i)
     {
-        DLOG(INFO) << "EloqStore::Start stage=shard_start_begin shard=" << i;
         shards_[i]->Start();
-        DLOG(INFO) << "EloqStore::Start stage=shard_start_end shard=" << i;
         ++started_shards;
     }
 
 #ifdef ELOQ_MODULE_ENABLED
-    DLOG(INFO) << "EloqStore::Start stage=module_register_begin";
     module_ = std::make_unique<EloqStoreModule>(&shards_);
     eloq::register_module(module_.get());
     for (auto &shard : shards_)
     {
         eloq::EloqModule::NotifyWorker(static_cast<int>(shard->shard_id_));
     }
-    DLOG(INFO) << "EloqStore::Start stage=module_register_end";
 #endif
 
     if (options_.data_append_mode && options_.num_retained_archives > 0 &&
@@ -989,6 +1094,7 @@ bool EloqStore::ExecAsyn(KvRequest *req)
     req->user_data_ = 0;
     req->callback_ = nullptr;
     req->reopen_retry_remaining_ = options_.auto_reopen_retry_times;
+    req->oom_retry_remaining_ = options_.auto_oom_retry_times;
     return SendRequest(req);
 }
 
@@ -997,6 +1103,7 @@ void EloqStore::ExecSync(KvRequest *req)
     req->user_data_ = 0;
     req->callback_ = nullptr;
     req->reopen_retry_remaining_ = options_.auto_reopen_retry_times;
+    req->oom_retry_remaining_ = options_.auto_oom_retry_times;
     if (SendRequest(req))
     {
         req->Wait();
@@ -1042,7 +1149,6 @@ KvError EloqStore::CollectTablePartitions(
                     continue;
                 }
                 std::string name = entry.path().filename().string();
-                DLOG(INFO) << "CollectTablePartitions: " << name;
                 TableIdent ident = TableIdent::FromString(name);
                 if (!ident.IsValid() || ident.tbl_name_ != table_name)
                 {
@@ -1121,7 +1227,7 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
     req->first_error_.store(static_cast<uint8_t>(KvError::NoError),
                             std::memory_order_relaxed);
     req->pending_.store(0, std::memory_order_relaxed);
-    req->truncate_reqs_.clear();
+    req->drop_reqs_.clear();
 
     std::vector<TableIdent> partitions;
     KvError err = CollectTablePartitions(req->TableName(), partitions);
@@ -1137,15 +1243,15 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
         return;
     }
 
-    req->truncate_reqs_.reserve(partitions.size());
+    req->drop_reqs_.reserve(partitions.size());
     req->pending_.store(static_cast<uint32_t>(partitions.size()),
                         std::memory_order_relaxed);
 
     for (const TableIdent &partition : partitions)
     {
-        auto trunc_req = std::make_unique<TruncateRequest>();
-        trunc_req->SetArgs(partition, std::string_view{});
-        req->truncate_reqs_.push_back(std::move(trunc_req));
+        auto drop_req = std::make_unique<DropRequest>();
+        drop_req->SetArgs(partition);
+        req->drop_reqs_.push_back(std::move(drop_req));
     }
 
     struct DropTableScheduleState
@@ -1156,7 +1262,7 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
         size_t total = 0;
         std::atomic<size_t> next_index{0};
 
-        bool HandleTruncateResult(KvError sub_err)
+        bool HandleDropResult(KvError sub_err)
         {
             if (sub_err != KvError::NoError)
             {
@@ -1178,9 +1284,9 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
             return false;
         }
 
-        void OnTruncateDone(KvRequest *sub_req)
+        void OnDropDone(KvRequest *sub_req)
         {
-            if (HandleTruncateResult(sub_req->Error()))
+            if (HandleDropResult(sub_req->Error()))
             {
                 return;
             }
@@ -1197,20 +1303,20 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
                     return;
                 }
 
-                TruncateRequest *ptr = req->truncate_reqs_[idx].get();
+                DropRequest *ptr = req->drop_reqs_[idx].get();
                 auto self = shared_from_this();
-                auto on_truncate_done = [self](KvRequest *sub_req)
-                { self->OnTruncateDone(sub_req); };
-                if (store->ExecAsyn(ptr, 0, on_truncate_done))
+                auto on_drop_done = [self](KvRequest *sub_req)
+                { self->OnDropDone(sub_req); };
+                if (store->ExecAsyn(ptr, 0, on_drop_done))
                 {
                     return;
                 }
 
-                LOG(ERROR) << "Handle droptable request, enqueue truncate "
+                LOG(ERROR) << "Handle droptable request, enqueue drop "
                               "request fail";
                 ptr->callback_ = nullptr;
                 ptr->SetDone(KvError::NotRunning);
-                if (HandleTruncateResult(KvError::NotRunning))
+                if (HandleDropResult(KvError::NotRunning))
                 {
                     return;
                 }
@@ -1221,7 +1327,7 @@ void EloqStore::HandleDropTableRequest(DropTableRequest *req)
     auto state = std::make_shared<DropTableScheduleState>();
     state->store = this;
     state->req = req;
-    state->total = req->truncate_reqs_.size();
+    state->total = req->drop_reqs_.size();
 
     size_t max_inflight =
         std::max<uint32_t>(options_.max_global_request_batch, 1);
@@ -2225,6 +2331,63 @@ const KvOptions &EloqStore::Options() const
     return options_;
 }
 
+size_t EloqStore::DataCacheHits() const
+{
+    size_t total = 0;
+    for (const auto &shard : shards_)
+    {
+        if (shard != nullptr)
+        {
+            total += shard->IndexManager()->DataCacheHits();
+        }
+    }
+    return total;
+}
+
+size_t EloqStore::DataCacheMisses() const
+{
+    size_t total = 0;
+    for (const auto &shard : shards_)
+    {
+        if (shard != nullptr)
+        {
+            total += shard->IndexManager()->DataCacheMisses();
+        }
+    }
+    return total;
+}
+
+void EloqStore::ResetDataCacheCounters()
+{
+    for (const auto &shard : shards_)
+    {
+        if (shard != nullptr)
+        {
+            shard->IndexManager()->ResetDataCacheCounters();
+        }
+    }
+}
+
+uint16_t EloqStore::GlobalRegMemIndexBase(size_t shard_id) const
+{
+    if (shard_id >= shards_.size() || shards_[shard_id] == nullptr)
+    {
+        return 0;
+    }
+    AsyncIoManager *io_mgr = shards_[shard_id]->IoManager();
+    return io_mgr == nullptr ? 0 : io_mgr->GlobalRegMemIndexBase();
+}
+
+size_t EloqStore::TailScratchAcquireCount(size_t shard_id) const
+{
+    if (shard_id >= shards_.size() || shards_[shard_id] == nullptr)
+    {
+        return 0;
+    }
+    AsyncIoManager *io_mgr = shards_[shard_id]->IoManager();
+    return io_mgr == nullptr ? 0 : io_mgr->TailScratchAcquireCount();
+}
+
 bool EloqStore::IsStopped() const
 {
     return status_.load(std::memory_order_acquire) == Status::Stopped;
@@ -2467,6 +2630,11 @@ void TruncateRequest::SetArgs(TableIdent tbl_id, std::string position)
     position_ = position_storage_;
 }
 
+void DropRequest::SetArgs(TableIdent tbl_id)
+{
+    SetTableId(std::move(tbl_id));
+}
+
 void ArchiveRequest::SetSnapshotTimestamp(uint64_t ts)
 {
     LOG_FIRST_N(WARNING, 1)
@@ -2501,7 +2669,7 @@ void DropTableRequest::SetArgs(std::string table_name)
         SetTableId({});
     }
     table_name_ = std::move(table_name);
-    truncate_reqs_.clear();
+    drop_reqs_.clear();
     pending_.store(0, std::memory_order_relaxed);
     first_error_.store(static_cast<uint8_t>(KvError::NoError),
                        std::memory_order_relaxed);

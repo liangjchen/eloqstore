@@ -1,4 +1,4 @@
-#include "storage/index_page_manager.h"
+#include "storage/page_manager.h"
 
 #include <glog/logging.h>
 
@@ -16,7 +16,7 @@
 #include "error.h"
 #include "kv_options.h"
 #include "replayer.h"
-#include "storage/mem_index_page.h"
+#include "storage/mem_cached_page.h"
 #include "storage/page_mapper.h"
 #include "storage/root_meta.h"
 #include "tasks/task.h"
@@ -58,16 +58,16 @@ size_t RootMetaBytes(const RootMeta &meta)
 
 }  // namespace
 
-IndexPageManager::IndexPageManager(AsyncIoManager *io_manager)
+PageManager::PageManager(AsyncIoManager *io_manager)
     : io_manager_(io_manager), root_meta_mgr_(this, Options())
 {
     active_head_.EnqueNext(&active_tail_);
     const size_t page_limit =
         EffectiveBufferPoolLimitBytes(Options()) / Options()->data_page_size;
-    index_pages_.reserve(page_limit);
+    cached_pages_.reserve(page_limit);
 }
 
-void IndexPageManager::Shutdown()
+void PageManager::Shutdown()
 {
     if (shutdown_)
     {
@@ -76,7 +76,7 @@ void IndexPageManager::Shutdown()
     shutdown_ = true;
 
     root_meta_mgr_.ReleaseMappers();
-    index_pages_.clear();
+    cached_pages_.clear();
 
     active_head_.next_ = &active_tail_;
     active_head_.prev_ = nullptr;
@@ -85,24 +85,23 @@ void IndexPageManager::Shutdown()
 
     free_head_.next_ = nullptr;
     free_head_.prev_ = nullptr;
-    free_head_.in_free_list_ = false;
 }
 
-const Comparator *IndexPageManager::GetComparator() const
+const Comparator *PageManager::GetComparator() const
 {
     return io_manager_->options_->comparator_;
 }
 
-MemIndexPage *IndexPageManager::AllocIndexPage()
+MemCachedPage *PageManager::AllocPage()
 {
-    MemIndexPage *next_free = free_head_.DequeNext();
+    MemCachedPage *next_free = free_head_.DequeNext();
 
     while (next_free == nullptr)
     {
         if (!IsFull())
         {
             auto &new_page =
-                index_pages_.emplace_back(std::make_unique<MemIndexPage>());
+                cached_pages_.emplace_back(std::make_unique<MemCachedPage>());
             next_free = new_page.get();
         }
         else
@@ -121,20 +120,18 @@ MemIndexPage *IndexPageManager::AllocIndexPage()
     assert(next_free->IsDetached());
     assert(!next_free->IsPinned());
     assert(next_free->Error() == KvError::NoError);
-    next_free->in_free_list_ = false;
     return next_free;
 }
 
-void IndexPageManager::FreeIndexPage(MemIndexPage *page)
+void PageManager::FreePage(MemCachedPage *page)
 {
     assert(page->IsDetached());
     assert(!page->IsPinned());
     page->SetError(KvError::NoError);
-    page->in_free_list_ = true;
     free_head_.EnqueNext(page);
 }
 
-void IndexPageManager::EnqueueIndexPage(MemIndexPage *page)
+void PageManager::EnqueuePage(MemCachedPage *page)
 {
     if (page->prev_ != nullptr)
     {
@@ -145,24 +142,24 @@ void IndexPageManager::EnqueueIndexPage(MemIndexPage *page)
     active_head_.EnqueNext(page);
 }
 
-bool IndexPageManager::IsFull() const
+bool PageManager::IsFull() const
 {
     // Calculate current total memory usage
-    size_t current_size = index_pages_.size() * Options()->data_page_size;
+    size_t current_size = cached_pages_.size() * Options()->data_page_size;
     return current_size >= EffectiveBufferPoolLimitBytes(Options());
 }
 
-size_t IndexPageManager::GetBufferPoolUsed() const
+size_t PageManager::GetBufferPoolUsed() const
 {
-    return index_pages_.size() * Options()->data_page_size;
+    return cached_pages_.size() * Options()->data_page_size;
 }
 
-size_t IndexPageManager::GetBufferPoolLimit() const
+size_t PageManager::GetBufferPoolLimit() const
 {
     return EffectiveBufferPoolLimitBytes(Options());
 }
 
-std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
+std::pair<RootMetaMgr::Handle, KvError> PageManager::FindRoot(
     const TableIdent &tbl_id)
 {
     auto load_meta = [this](RootMetaMgr::Entry *entry)
@@ -187,8 +184,20 @@ std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
         auto mapper =
             replayer.GetMapper(this, &entry_tbl, IoMgr()->ProcessTerm());
         MappingSnapshot *mapping = mapper->GetMapping();
+        meta->first_unflushed_fp_id_ =
+            mapper->FilePgAllocator()->MaxFilePageId();
         meta->mapper_ = std::move(mapper);
         meta->mapping_snapshots_.insert(mapping);
+        auto seg_mapper =
+            replayer.GetSegmentMapper(this, &entry_tbl, IoMgr()->ProcessTerm());
+        if (seg_mapper != nullptr)
+        {
+            MappingSnapshot *seg_mapping = seg_mapper->GetMapping();
+            meta->first_unflushed_seg_fp_id_ =
+                seg_mapper->FilePgAllocator()->MaxFilePageId();
+            meta->segment_mapper_ = std::move(seg_mapper);
+            meta->segment_mapping_snapshots_.insert(seg_mapping);
+        }
         root_meta_mgr_.UpdateBytes(entry, RootMetaBytes(*meta));
         err = root_meta_mgr_.EvictIfNeeded();
         CHECK_KV_ERR(err);
@@ -210,31 +219,24 @@ std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
         if (!replayer.branch_metadata_.file_ranges.empty())
         {
             const auto &ranges = replayer.branch_metadata_.file_ranges;
-            // Validate invariants restored from the manifest:
-            //   1. max_file_id is strictly ascending across all entries.
-            //   2. All entries for the same branch_name are contiguous
-            //      (no other branch's entries interleaved within a branch's
-            //      block).
-            //   3. For each branch, term is non-decreasing in max_file_id
-            //      order.
             std::unordered_map<std::string, uint64_t> branch_last_term;
             std::string last_branch_name;
             for (size_t i = 0; i < ranges.size(); ++i)
             {
-                if (i > 0 && ranges[i].max_file_id <= ranges[i - 1].max_file_id)
+                if (i > 0 &&
+                    ranges[i].max_file_id_ <= ranges[i - 1].max_file_id_)
                 {
                     LOG(ERROR)
                         << "branch_metadata file_ranges: max_file_id not "
                            "strictly ascending at index "
-                        << i << " (prev=" << ranges[i - 1].max_file_id
-                        << ", cur=" << ranges[i].max_file_id << ")";
+                        << i << " (prev=" << ranges[i - 1].max_file_id_
+                        << ", cur=" << ranges[i].max_file_id_ << ")";
                     return KvError::Corrupted;
                 }
-                const std::string &bn = ranges[i].branch_name;
+                const std::string &bn = ranges[i].branch_name_;
                 auto it = branch_last_term.find(bn);
                 if (it != branch_last_term.end())
                 {
-                    // Branch seen before — entries must be contiguous.
                     if (bn != last_branch_name)
                     {
                         LOG(ERROR)
@@ -244,22 +246,21 @@ std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
                             << last_branch_name << "')";
                         return KvError::Corrupted;
                     }
-                    // Term must not decrease within the branch's block.
-                    if (ranges[i].term < it->second)
+                    if (ranges[i].term_ < it->second)
                     {
                         LOG(ERROR)
                             << "branch_metadata file_ranges: term decreases "
                                "for branch '"
                             << bn << "' at index " << i
                             << " (prev_term=" << it->second
-                            << ", cur_term=" << ranges[i].term << ")";
+                            << ", cur_term=" << ranges[i].term_ << ")";
                         return KvError::Corrupted;
                     }
-                    it->second = ranges[i].term;
+                    it->second = ranges[i].term_;
                 }
                 else
                 {
-                    branch_last_term.emplace(bn, ranges[i].term);
+                    branch_last_term.emplace(bn, ranges[i].term_);
                 }
                 last_branch_name = bn;
             }
@@ -305,9 +306,9 @@ std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
             // Partition not found. Possible causes:
             // 1. During the initial write to a non-existent partition,
             //    WriteTask creates a stub RootMeta (with mapper=nullptr).
-            // 2. A MemIndexPage referencing this stub RootMeta is created.
+            // 2. A MemCachedPage referencing this stub RootMeta is created.
             // 3. WriteTask aborts, but the stub RootMeta cannot be cleared
-            //    because it is still referenced by the MemIndexPage.
+            //    because it is still referenced by the MemCachedPage.
             return {RootMetaMgr::Handle(&root_meta_mgr_, entry),
                     KvError::NotFound};
         }
@@ -315,8 +316,8 @@ std::pair<RootMetaMgr::Handle, KvError> IndexPageManager::FindRoot(
     }
 }
 
-KvError IndexPageManager::MakeCowRoot(const TableIdent &tbl_ident,
-                                      CowRootMeta &cow_meta)
+KvError PageManager::MakeCowRoot(const TableIdent &tbl_ident,
+                                 CowRootMeta &cow_meta)
 {
     cow_meta.root_handle_ = RootMetaMgr::Handle();
     auto [found_handle, err] = FindRoot(tbl_ident);
@@ -342,6 +343,14 @@ KvError IndexPageManager::MakeCowRoot(const TableIdent &tbl_ident,
             assert(cow_meta.manifest_size_ == 0);
         }
         cow_meta.compression_ = meta->compression_;
+        // Copy segment mapper if present.
+        if (meta->segment_mapper_ != nullptr)
+        {
+            cow_meta.segment_mapper_ =
+                std::make_unique<PageMapper>(*meta->segment_mapper_);
+            cow_meta.old_segment_mapping_ =
+                meta->segment_mapper_->GetMappingSnapshot();
+        }
     }
     else if (err == KvError::NotFound)
     {
@@ -377,11 +386,16 @@ KvError IndexPageManager::MakeCowRoot(const TableIdent &tbl_ident,
     }
     auto it = meta->mapping_snapshots_.insert(cow_meta.mapper_->GetMapping());
     CHECK(it.second);
+    if (cow_meta.segment_mapper_ != nullptr)
+    {
+        auto seg_it = meta->segment_mapping_snapshots_.insert(
+            cow_meta.segment_mapper_->GetMapping());
+        CHECK(seg_it.second);
+    }
     return KvError::NoError;
 }
 
-void IndexPageManager::UpdateRoot(const TableIdent &tbl_ident,
-                                  CowRootMeta new_meta)
+void PageManager::UpdateRoot(const TableIdent &tbl_ident, CowRootMeta new_meta)
 {
     auto *entry = root_meta_mgr_.Find(tbl_ident);
     assert(entry != nullptr);
@@ -395,15 +409,23 @@ void IndexPageManager::UpdateRoot(const TableIdent &tbl_ident,
         prev_snapshot->next_snapshot_ = new_meta.mapper_->GetMappingSnapshot();
     }
     meta.mapper_ = std::move(new_meta.mapper_);
+    // Update segment mapper if present in the new meta.
+    // Segment mapping is always append-only, so no snapshot chaining needed.
+    if (new_meta.segment_mapper_ != nullptr)
+    {
+        meta.segment_mapper_ = std::move(new_meta.segment_mapper_);
+    }
     meta.manifest_size_ = new_meta.manifest_size_;
     meta.next_expire_ts_ = new_meta.next_expire_ts_;
     meta.compression_ = std::move(new_meta.compression_);
+    meta.first_unflushed_fp_id_ = new_meta.first_unflushed_fp_id_;
+    meta.first_unflushed_seg_fp_id_ = new_meta.first_unflushed_seg_fp_id_;
     root_meta_mgr_.UpdateBytes(entry, RootMetaBytes(meta));
     root_meta_mgr_.EvictIfNeeded();
 }
 
-KvError IndexPageManager::InstallEmptySnapshot(const TableIdent &tbl_ident,
-                                               CowRootMeta &cow_meta)
+KvError PageManager::InstallEmptySnapshot(const TableIdent &tbl_ident,
+                                          CowRootMeta &cow_meta)
 {
     auto [entry, inserted] = RootMetaManager()->GetOrCreate(tbl_ident);
     static_cast<void>(inserted);
@@ -440,15 +462,16 @@ KvError IndexPageManager::InstallEmptySnapshot(const TableIdent &tbl_ident,
     auto it = meta.mapping_snapshots_.insert(cow_meta.mapper_->GetMapping());
     CHECK(it.second);
     cow_meta.manifest_size_ = snapshot.size();
+    cow_meta.first_unflushed_fp_id_ = max_fp_id;
 
     UpdateRoot(tbl_ident, std::move(cow_meta));
     IoMgr()->SetBranchFileMapping(entry->tbl_id_, {});
     return KvError::NoError;
 }
 
-KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
-                                                  CowRootMeta &cow_meta,
-                                                  std::string_view reopen_tag)
+KvError PageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
+                                             CowRootMeta &cow_meta,
+                                             std::string_view reopen_tag)
 {
     CHECK(eloq_store != nullptr);
     const StoreMode mode = eloq_store->Mode();
@@ -480,13 +503,18 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
                 std::string branch_name;
                 uint64_t term;
                 if (!IoMgr()->GetBranchNameAndTerm(
-                        tbl_ident, max_file_id, branch_name, term))
+                        tbl_ident, DataFileKey(max_file_id), branch_name, term))
                 {
                     branch_name = IoMgr()->GetActiveBranch();
                     term = IoMgr()->ProcessTerm();
                 }
-                KvError sync_err = cloud_mgr->DownloadFile(
-                    tbl_ident, max_file_id, branch_name, term, true, offset);
+                KvError sync_err =
+                    cloud_mgr->DownloadFile(tbl_ident,
+                                            DataFileKey(max_file_id),
+                                            branch_name,
+                                            term,
+                                            true,
+                                            offset);
                 if (sync_err != KvError::NoError &&
                     sync_err != KvError::NotFound &&
                     sync_err != KvError::ResourceMissing)
@@ -519,7 +547,33 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
         {
             LOG(INFO) << "InstallExternalSnapshot missing remote state for "
                       << "table " << tbl_ident << ", tag " << reopen_tag;
-            return InstallEmptySnapshot(tbl_ident, cow_meta);
+
+            // Delete any stale local manifest and clear in-memory state.
+            KvError drop_err = IoMgr()->DropManifest(tbl_ident);
+            if (drop_err != KvError::NoError)
+            {
+                LOG(WARNING) << "InstallExternalSnapshot DropManifest failed "
+                             << "for table " << tbl_ident << ", error "
+                             << static_cast<uint32_t>(drop_err);
+            }
+
+            auto [entry, inserted] = RootMetaManager()->GetOrCreate(tbl_ident);
+            static_cast<void>(inserted);
+            RootMeta &meta = entry->meta_;
+            meta.root_id_ = MaxPageId;
+            meta.ttl_root_id_ = MaxPageId;
+            meta.manifest_size_ = 0;
+            meta.next_expire_ts_ = 0;
+            meta.mapper_.reset();
+            meta.mapping_snapshots_.clear();
+            meta.compression_.reset();
+            RootMetaManager()->UpdateBytes(entry, 0);
+
+            cow_meta = CowRootMeta();
+            cow_meta.root_id_ = MaxPageId;
+            cow_meta.ttl_root_id_ = MaxPageId;
+            cow_meta.manifest_size_ = 0;
+            return KvError::NoError;
         }
         LOG(ERROR) << "InstallExternalSnapshot RefreshManifest failed, table "
                    << tbl_ident << ", mode " << static_cast<int>(mode)
@@ -546,7 +600,7 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
     meta.mapping_snapshots_.insert(mapping);
 
     // Reuse swizzling pointers when file_page_id is unchanged.
-    for (MemIndexPage *page : meta.index_pages_)
+    for (MemCachedPage *page : meta.cached_pages_)
     {
         PageId page_id = page->GetPageId();
         if (page_id >= mapping->mapping_tbl_.size())
@@ -561,10 +615,25 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
         }
     }
 
+    // Replay the segment mapper as well so a reopened partition keeps any
+    // persisted segment mapping (very-large values). Mirrors the load_meta
+    // path in FindRoot.
+    auto seg_mapper = replayer.GetSegmentMapper(
+        this, &entry->tbl_id_, IoMgr()->ProcessTerm());
+
     cow_meta = CowRootMeta();
     cow_meta.root_id_ = replayer.root_;
     cow_meta.ttl_root_id_ = replayer.ttl_root_;
+    cow_meta.first_unflushed_fp_id_ =
+        mapper->FilePgAllocator()->MaxFilePageId();
     cow_meta.mapper_ = std::move(mapper);
+    if (seg_mapper != nullptr)
+    {
+        meta.segment_mapping_snapshots_.insert(seg_mapper->GetMapping());
+        cow_meta.first_unflushed_seg_fp_id_ =
+            seg_mapper->FilePgAllocator()->MaxFilePageId();
+        cow_meta.segment_mapper_ = std::move(seg_mapper);
+    }
     cow_meta.manifest_size_ = replayer.file_size_;
     cow_meta.next_expire_ts_ = replayer.ttl_root_ != MaxPageId ? 1 : 0;
     cow_meta.compression_ = std::make_shared<compression::DictCompression>();
@@ -584,20 +653,20 @@ KvError IndexPageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
     return KvError::NoError;
 }
 
-std::pair<MemIndexPage::Handle, KvError> IndexPageManager::FindPage(
+std::pair<MemCachedPage::Handle, KvError> PageManager::FindPage(
     MappingSnapshot *mapping, PageId page_id)
 {
     while (true)
     {
         // First checks swizzling pointers.
-        MemIndexPage::Handle handle = mapping->GetSwizzlingHandle(page_id);
+        MemCachedPage::Handle handle = mapping->GetSwizzlingHandle(page_id);
         if (!handle)
         {
             // This is the first request to load the page.
-            MemIndexPage *new_page = AllocIndexPage();
+            MemCachedPage *new_page = AllocPage();
             if (new_page == nullptr)
             {
-                return {MemIndexPage::Handle(), KvError::OutOfMem};
+                return {MemCachedPage::Handle(), KvError::OutOfMem};
             }
             FilePageId file_page_id = mapping->ToFilePage(page_id);
             new_page->SetPageId(page_id);
@@ -619,13 +688,13 @@ std::pair<MemIndexPage::Handle, KvError> IndexPageManager::FindPage(
                 else
                 {
                     CHECK(new_page->waiting_.Empty());
-                    FreeIndexPage(new_page);
+                    FreePage(new_page);
                 }
-                return {MemIndexPage::Handle(), err};
+                return {MemCachedPage::Handle(), err};
             }
             FinishIo(mapping, new_page);
             new_page->waiting_.WakeAll();
-            return {MemIndexPage::Handle(new_page), KvError::NoError};
+            return {MemCachedPage::Handle(new_page), KvError::NoError};
         }
         if (handle->IsDetached())
         {
@@ -633,26 +702,26 @@ std::pair<MemIndexPage::Handle, KvError> IndexPageManager::FindPage(
             handle->waiting_.Wait(ThdTask());
             if (handle->Error() != KvError::NoError)
             {
-                MemIndexPage *page = handle.Get();
+                MemCachedPage *page = handle.Get();
                 KvError err = page->Error();
                 handle.Reset();
                 if (!page->IsPinned())
                 {
-                    FreeIndexPage(page);
+                    FreePage(page);
                 }
-                return {MemIndexPage::Handle(), err};
+                return {MemCachedPage::Handle(), err};
             }
             assert(handle->IsPinned());
         }
         else
         {
-            EnqueueIndexPage(handle.Get());
+            EnqueuePage(handle.Get());
             return {std::move(handle), KvError::NoError};
         }
     }
 }
 
-void IndexPageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
+void PageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
 {
     const TableIdent &tbl = *mapping->tbl_ident_;
     auto *entry = root_meta_mgr_.Find(tbl);
@@ -661,7 +730,8 @@ void IndexPageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
         return;
     }
     RootMeta &meta = entry->meta_;
-    // Puts back file pages freed in this mapping snapshot
+    // Puts back file pages freed in this mapping snapshot.
+    // Only applicable to non-append-mode page mappings.
     if (!mapping->to_free_file_pages_.empty())
     {
         assert(meta.mapper_ != nullptr);
@@ -671,12 +741,28 @@ void IndexPageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
         pool->Free(std::move(mapping->to_free_file_pages_));
     }
     auto n = meta.mapping_snapshots_.erase(mapping);
+    if (n == 0)
+    {
+        // If the input mapping is a segment mapping, removes it from the
+        // segment mapping collection.
+        n = meta.segment_mapping_snapshots_.erase(mapping);
+    }
     CHECK(n == 1);
 }
 
-bool IndexPageManager::Evict()
+void PageManager::TryRecycleCachedPage(MemCachedPage *page)
 {
-    MemIndexPage *node = &active_tail_;
+    if (page == nullptr || page->IsPinned() || page->IsDetached())
+    {
+        return;
+    }
+    assert(page->tbl_ident_ != nullptr && page->page_id_ != MaxPageId);
+    RecyclePage(page);
+}
+
+bool PageManager::Evict()
+{
+    MemCachedPage *node = &active_tail_;
 
     do
     {
@@ -698,7 +784,7 @@ bool IndexPageManager::Evict()
     return true;
 }
 
-bool IndexPageManager::RecyclePage(MemIndexPage *page)
+bool PageManager::RecyclePage(MemCachedPage *page)
 {
     assert(!page->IsPinned());
     RootMetaMgr::Entry *entry = root_meta_mgr_.Find(*page->tbl_ident_);
@@ -711,7 +797,7 @@ bool IndexPageManager::RecyclePage(MemIndexPage *page)
         {
             mapping->Unswizzling(page);
         }
-        meta.index_pages_.erase(page);
+        meta.cached_pages_.erase(page);
     }
 
     // Removes the page from the active list.
@@ -722,12 +808,11 @@ bool IndexPageManager::RecyclePage(MemIndexPage *page)
     page->file_page_id_ = MaxFilePageId;
     page->tbl_ident_ = nullptr;
 
-    FreeIndexPage(page);
+    FreePage(page);
     return true;
 }
 
-void IndexPageManager::FinishIo(MappingSnapshot *mapping,
-                                MemIndexPage *idx_page)
+void PageManager::FinishIo(MappingSnapshot *mapping, MemCachedPage *idx_page)
 {
     idx_page->tbl_ident_ = mapping->tbl_ident_;
     mapping->AddSwizzling(idx_page->GetPageId(), idx_page);
@@ -735,15 +820,15 @@ void IndexPageManager::FinishIo(MappingSnapshot *mapping,
     auto *entry = root_meta_mgr_.Find(*mapping->tbl_ident_);
     if (entry != nullptr)
     {
-        entry->meta_.index_pages_.insert(idx_page);
+        entry->meta_.cached_pages_.insert(idx_page);
     }
-    EnqueueIndexPage(idx_page);
+    EnqueuePage(idx_page);
 }
 
-KvError IndexPageManager::SeekIndex(MappingSnapshot *mapping,
-                                    PageId page_id,
-                                    std::string_view key,
-                                    PageId &result)
+KvError PageManager::SeekIndex(MappingSnapshot *mapping,
+                               PageId page_id,
+                               std::string_view key,
+                               PageId &result)
 {
     PageId current_id = page_id;
     while (true)
@@ -764,27 +849,27 @@ KvError IndexPageManager::SeekIndex(MappingSnapshot *mapping,
     }
 }
 
-const KvOptions *IndexPageManager::Options() const
+const KvOptions *PageManager::Options() const
 {
     return io_manager_->options_;
 }
 
-AsyncIoManager *IndexPageManager::IoMgr() const
+AsyncIoManager *PageManager::IoMgr() const
 {
     return io_manager_;
 }
 
-MappingArena *IndexPageManager::MapperArena()
+MappingArena *PageManager::MapperArena()
 {
     return &mapping_arena_;
 }
 
-MappingChunkArena *IndexPageManager::MapperChunkArena()
+MappingChunkArena *PageManager::MapperChunkArena()
 {
     return &mapping_chunk_arena_;
 }
 
-RootMetaMgr *IndexPageManager::RootMetaManager()
+RootMetaMgr *PageManager::RootMetaManager()
 {
     return &root_meta_mgr_;
 }

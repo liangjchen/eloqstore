@@ -4,7 +4,7 @@
 
 #include "eloq_store.h"
 #include "standby_service.h"
-#include "storage/index_page_manager.h"
+#include "storage/page_manager.h"
 #include "storage/shard.h"
 #include "tasks/prewarm_task.h"
 
@@ -61,7 +61,33 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
     KvError err = KvError::NoError;
     if (request->Clean())
     {
-        err = shard->IndexManager()->InstallEmptySnapshot(tbl_id, cow_meta_);
+        // Remote partition no longer exists — delete local manifest and
+        // clear in-memory state instead of writing an empty snapshot.
+        err = shard->IoManager()->DropManifest(tbl_id);
+        if (err != KvError::NoError)
+        {
+            LOG(ERROR) << "Reopen " << tbl_id << " DropManifest failed, tag "
+                       << request->Tag() << ", error "
+                       << static_cast<uint32_t>(err);
+            return err;
+        }
+        RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
+        auto *entry = root_meta_mgr->Find(tbl_id);
+        if (entry != nullptr)
+        {
+            RootMeta &meta = entry->meta_;
+            meta.root_id_ = MaxPageId;
+            meta.ttl_root_id_ = MaxPageId;
+            meta.manifest_size_ = 0;
+            meta.next_expire_ts_ = 0;
+            meta.mapper_.reset();
+            meta.mapping_snapshots_.clear();
+            meta.compression_.reset();
+            root_meta_mgr->UpdateBytes(entry, 0);
+        }
+        cow_meta_ = CowRootMeta();
+        cow_meta_.root_id_ = MaxPageId;
+        cow_meta_.ttl_root_id_ = MaxPageId;
     }
     else
     {
@@ -84,22 +110,7 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
         prewarm_service->Prewarm(tbl_id);
     }
 
-    const bool empty_snapshot =
-        cow_meta_.root_id_ == MaxPageId && cow_meta_.ttl_root_id_ == MaxPageId;
-    if (mode == StoreMode::Cloud && empty_snapshot)
-    {
-        auto *cloud_mgr = static_cast<CloudStoreMgr *>(shard->IoManager());
-        err = cloud_mgr->CleanupLocalPartitionFiles(tbl_id);
-        if (err != KvError::NoError)
-        {
-            LOG(ERROR) << "Reopen " << tbl_id
-                       << " failed to cleanup local partition files, tag "
-                       << request->Tag() << ", error "
-                       << static_cast<uint32_t>(err);
-            return err;
-        }
-    }
-    else if (!shard->HasPendingLocalGc(tbl_id))
+    if (!shard->HasPendingLocalGc(tbl_id))
     {
         shard->AddPendingLocalGc(tbl_id);
     }

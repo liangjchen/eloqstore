@@ -1,5 +1,7 @@
 #pragma once
 
+#include <span>
+#include <string_view>
 #include <utility>
 
 #include "storage/data_page_builder.h"
@@ -28,19 +30,21 @@ public:
 
     KvError CleanExpiredKeys();
 
+    KvError Drop();
+
 private:
     KvError ApplyBatch(PageId &root_id, bool update_ttl, uint64_t now_ts = 0);
     KvError ApplyTTLBatch();
     KvError ApplyOnePage(size_t &cidx, uint64_t now_ms);
 
     KvError LoadApplyingPage(PageId page_id);
-    std::pair<MemIndexPage::Handle, KvError> Pop();
+    std::pair<MemCachedPage::Handle, KvError> Pop();
 
-    KvError FinishIndexPage(MemIndexPage::Handle &prev_handle,
+    KvError FinishIndexPage(MemCachedPage::Handle &prev_handle,
                             std::string &prev_key,
                             PageId &prev_page_id,
                             std::string cur_page_key);
-    KvError FlushIndexPage(MemIndexPage::Handle &new_page,
+    KvError FlushIndexPage(MemCachedPage::Handle &new_page,
                            std::string idx_page_key,
                            PageId page_id,
                            bool split);
@@ -55,7 +59,7 @@ private:
      * @return The current page after redistributing.
      */
     Page Redistribute(DataPage &prev_page, std::string_view cur_page);
-    std::string_view Redistribute(MemIndexPage::Handle &prev_handle,
+    std::string_view Redistribute(MemCachedPage::Handle &prev_handle,
                                   std::string_view cur_page,
                                   std::string &cur_page_key);
 
@@ -155,12 +159,54 @@ private:
     KvError DelOverflowValue(std::string_view encoded_ptrs);
 
     /**
+     * @brief Write a very large value to segment files.
+     *
+     * Dispatches on `entry.large_val_`'s active variant:
+     *  - `IoStringBuffer`: derives per-segment ptrs / buf_indices from the
+     *    fragments and forwards to WriteLargeValueSegments.
+     *  - `std::pair<const char *, size_t>` (pinned): splits the contiguous
+     *    range into K = ceil(size / segment_size) segment-sized chunks,
+     *    looks up the shared buf_index once via AsyncIoManager::
+     *    BufIndexForAddress, and forwards.
+     *
+     * On both arms, `entry.val_` is passed as the metadata blob -- empty
+     * for legacy IoStringBuffer writes (the metadata trailer is omitted),
+     * non-empty for KV Cache pinned writes that carry metadata.
+     */
+    KvError WriteLargeValue(const WriteDataEntry &entry);
+
+    /**
+     * @brief Shared core of WriteLargeValue: allocates K logical/physical
+     * segment IDs, issues batched WriteSegments, and encodes the resulting
+     * value content (including @p metadata) into `large_value_content_`.
+     *
+     * @param actual_length True byte length of the very large value.
+     * @param ptrs Source pointers for each segment (size = K).
+     * @param buf_indices io_uring buffer index per segment (size = K).
+     * @param metadata Optional metadata blob to append in the encoded trailer.
+     */
+    KvError WriteLargeValueSegments(uint32_t actual_length,
+                                    std::span<const char *> ptrs,
+                                    std::span<const uint16_t> buf_indices,
+                                    std::string_view metadata);
+    /**
+     * @brief Free logical segments for a deleted/overwritten large value.
+     * @param encoded_content The encoded large value content from the data
+     * page.
+     */
+    void DelLargeValue(std::string_view encoded_content);
+
+    void EnsureSegmentMapper();
+
+    std::string large_value_content_;
+
+    /**
      * @brief Truncate the data page at page_id from the trunc_pos.
      * @return true if the page is empty after truncation.
      */
     std::pair<bool, KvError> TruncateDataPage(PageId page_id,
                                               std::string_view trunc_pos);
-    std::pair<MemIndexPage::Handle, KvError> TruncateIndexPage(
+    std::pair<MemCachedPage::Handle, KvError> TruncateIndexPage(
         PageId page_id, std::string_view trunc_pos);
 
     static void AdvanceDataPageIter(DataPageIter &iter, bool &is_valid);

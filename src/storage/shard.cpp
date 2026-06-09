@@ -17,6 +17,7 @@
 
 #include "async_io_manager.h"
 #include "error.h"
+#include "global_registered_memory.h"
 #include "standby_service.h"
 #include "tasks/list_object_task.h"
 #include "tasks/list_standby_partition_task.h"
@@ -52,7 +53,15 @@ Shard::Shard(EloqStore *store, size_t shard_id, uint32_t fd_limit)
       task_mgr_(&store->options_),
       stack_allocator_(store->options_.coroutine_stack_size),
       io_mgr_(AsyncIoManager::Instance(store, fd_limit)),
-      index_mgr_(io_mgr_.get()) {};
+      index_mgr_(io_mgr_.get())
+{
+    const auto &opts = store_->options_;
+    if (!opts.global_registered_memories.empty())
+    {
+        assert(shard_id_ < opts.global_registered_memories.size());
+        global_reg_mem_ = opts.global_registered_memories[shard_id_];
+    }
+}
 
 KvError Shard::Init()
 {
@@ -183,7 +192,7 @@ void Shard::WorkLoop()
     }
 
     task_mgr_.Shutdown();
-    // Unfinished tasks may still own MemIndexPage::Handle instances.
+    // Unfinished tasks may still own MemCachedPage::Handle instances.
     // Release task state before tearing down the index-page pool they
     // reference.
     index_mgr_.Shutdown();
@@ -402,7 +411,7 @@ bool Shard::NeedStop() const
 }
 #endif
 
-IndexPageManager *Shard::IndexManager()
+PageManager *Shard::IndexManager()
 {
     return &index_mgr_;
 }
@@ -420,6 +429,11 @@ TaskManager *Shard::TaskMgr()
 PagesPool *Shard::PagePool()
 {
     return &page_pool_;
+}
+
+GlobalRegisteredMemory *Shard::GlobalRegMem()
+{
+    return global_reg_mem_;
 }
 
 void Shard::OnReceivedReq(KvRequest *req)
@@ -488,12 +502,81 @@ bool Shard::ProcessReq(KvRequest *req)
         auto lbd = [task, req]() -> KvError
         {
             auto read_req = static_cast<ReadRequest *>(req);
-            KvError err = task->Read(req->TableId(),
-                                     read_req->Key(),
-                                     read_req->value_,
-                                     read_req->ts_,
-                                     read_req->expire_ts_);
-            return err;
+            // The variant alternative selects the destination; the type
+            // system enforces "at most one container" so no runtime check
+            // is needed.
+            return std::visit(
+                [&](auto &&dest) -> KvError
+                {
+                    using T = std::decay_t<decltype(dest)>;
+                    if constexpr (std::is_same_v<T, std::monostate>)
+                    {
+                        // No destination -- metadata-only mode. No segment
+                        // reads; `value_` receives inline value or
+                        // metadata. `large_value_only_` is meaningless
+                        // here (there is no value bytes destination).
+                        return task->Read(req->TableId(),
+                                          read_req->Key(),
+                                          read_req->value_,
+                                          read_req->ts_,
+                                          read_req->expire_ts_,
+                                          /*iosb=*/nullptr,
+                                          /*extract_metadata=*/true);
+                    }
+                    else if constexpr (std::is_same_v<T, IoStringBuffer>)
+                    {
+                        // Legacy zero-copy: dispatch fills the
+                        // IoStringBuffer that lives inside the variant. The
+                        // caller reads fragments back out via
+                        // std::get<IoStringBuffer>(...) after the request
+                        // completes. `large_value_only_` skips the metadata
+                        // trailer extraction.
+                        //
+                        // Reject this arm in KV Cache pinned mode: the
+                        // fragments would be allocated from EloqStore's
+                        // internal GC pool, which is reserved for GC /
+                        // compaction. No public API exposes that pool, so
+                        // the caller cannot Recycle the fragments and the
+                        // pool would leak. Pinned-mode callers must use
+                        // overload B (metadata + pinned dst) or overload C
+                        // (pinned-only) where the destination is caller-
+                        // owned.
+                        if (!shard->store_->Options()
+                                 .pinned_memory_chunks.empty())
+                        {
+                            return KvError::InvalidArgs;
+                        }
+                        return task->Read(req->TableId(),
+                                          read_req->Key(),
+                                          read_req->value_,
+                                          read_req->ts_,
+                                          read_req->expire_ts_,
+                                          &dest,
+                                          !read_req->large_value_only_);
+                    }
+                    else
+                    {
+                        // KV Cache pinned destination. Overload C skips
+                        // metadata extraction; overload B includes it.
+                        if (read_req->large_value_only_)
+                        {
+                            return task->Read(req->TableId(),
+                                              read_req->Key(),
+                                              read_req->ts_,
+                                              read_req->expire_ts_,
+                                              dest.first,
+                                              dest.second);
+                        }
+                        return task->Read(req->TableId(),
+                                          read_req->Key(),
+                                          read_req->value_,
+                                          read_req->ts_,
+                                          read_req->expire_ts_,
+                                          dest.first,
+                                          dest.second);
+                    }
+                },
+                read_req->large_value_dest_);
         };
         StartTask(task, req, lbd);
         return true;
@@ -509,7 +592,8 @@ bool Shard::ProcessReq(KvRequest *req)
                                       floor_req->floor_key_,
                                       floor_req->value_,
                                       floor_req->ts_,
-                                      floor_req->expire_ts_);
+                                      floor_req->expire_ts_,
+                                      &floor_req->large_value_);
             return err;
         };
         StartTask(task, req, lbd);
@@ -632,6 +716,17 @@ bool Shard::ProcessReq(KvRequest *req)
         StartTask(task, req, lbd);
         return true;
     }
+    case RequestType::Drop:
+    {
+        BatchWriteTask *task = task_mgr_.GetBatchWriteTask(req->TableId());
+        if (task == nullptr)
+        {
+            return false;
+        }
+        auto lbd = [task]() -> KvError { return task->Drop(); };
+        StartTask(task, req, lbd);
+        return true;
+    }
     case RequestType::DropTable:
     {
         LOG(ERROR) << "DropTable request routed to shard unexpectedly";
@@ -686,7 +781,7 @@ bool Shard::ProcessReq(KvRequest *req)
         {
             return false;
         }
-        auto lbd = [task]() -> KvError { return task->CompactDataFile(); };
+        auto lbd = [task]() -> KvError { return task->Compact(); };
         StartTask(task, req, lbd);
         return true;
     }
@@ -805,8 +900,10 @@ void Shard::OnTaskFinished(KvTask *task)
 {
     KvRequest *req = task->req_;
     const bool auto_reopen = task->needs_auto_reopen_;
+    const bool oom_retry = task->needs_oom_retry_;
     task->req_ = nullptr;
     task->needs_auto_reopen_ = false;
+    task->needs_oom_retry_ = false;
 
     if (!task->ReadOnly())
     {
@@ -826,6 +923,24 @@ void Shard::OnTaskFinished(KvTask *task)
     else
     {
         task_mgr_.FreeTask(task);
+    }
+
+    if (oom_retry)
+    {
+        // The aborted task released its pins; re-enqueue the request at the
+        // tail of this shard's queue so other in-flight tasks get a chance
+        // to release their pins before the next attempt.
+        req->err_ = KvError::NoError;
+#ifdef ELOQ_MODULE_ENABLED
+        {
+            std::lock_guard<bthread::Mutex> lk(req->mutex_);
+            req->done_ = false;
+        }
+#else
+        req->done_.store(false, std::memory_order_relaxed);
+#endif
+        AddKvRequest(req);
+        return;
     }
 
     if (__builtin_expect(!auto_reopen, 1))

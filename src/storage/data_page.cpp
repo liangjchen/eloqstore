@@ -12,6 +12,7 @@
 #include "coding.h"
 #include "compression.h"
 #include "kv_options.h"
+#include "storage/mem_cached_page.h"
 
 namespace eloqstore
 {
@@ -20,9 +21,15 @@ DataPage::DataPage(PageId page_id) : page_id_(page_id)
     page_ = Page{true};
 }
 
-DataPage::DataPage(DataPage &&rhs)
-    : page_id_(rhs.page_id_), page_(std::move(rhs.page_))
+DataPage::DataPage(PageId page_id, MemCachedPage *pinned)
+    : page_id_(page_id), cached_(pinned)
 {
+}
+
+DataPage::DataPage(DataPage &&rhs)
+    : page_id_(rhs.page_id_), page_(std::move(rhs.page_)), cached_(rhs.cached_)
+{
+    rhs.cached_ = nullptr;
 }
 
 DataPage &DataPage::operator=(DataPage &&other) noexcept
@@ -32,42 +39,60 @@ DataPage &DataPage::operator=(DataPage &&other) noexcept
         Clear();
         page_id_ = other.page_id_;
         page_ = std::move(other.page_);
+        cached_ = other.cached_;
+        other.cached_ = nullptr;
     }
     return *this;
 }
 
+DataPage::~DataPage()
+{
+    if (cached_ != nullptr)
+    {
+        cached_->Unpin();
+    }
+}
+
 bool DataPage::IsEmpty() const
 {
-    return page_.Ptr() == nullptr;
+    return cached_ == nullptr && page_.Ptr() == nullptr;
+}
+
+Page DataPage::ExtractPage()
+{
+    assert(cached_ == nullptr);
+    return std::move(page_);
 }
 
 uint16_t DataPage::ContentLength() const
 {
-    return DecodeFixed16(page_.Ptr() + page_size_offset);
+    return DecodeFixed16(PagePtr() + page_size_offset);
 }
 
 uint16_t DataPage::RestartNum() const
 {
-    return DecodeFixed16(page_.Ptr() + ContentLength() - sizeof(uint16_t));
+    return DecodeFixed16(PagePtr() + ContentLength() - sizeof(uint16_t));
 }
 
 PageId DataPage::PrevPageId() const
 {
-    return DecodeFixed32(page_.Ptr() + prev_page_offset);
+    return DecodeFixed32(PagePtr() + prev_page_offset);
 }
 
 PageId DataPage::NextPageId() const
 {
-    return DecodeFixed32(page_.Ptr() + next_page_offset);
+    return DecodeFixed32(PagePtr() + next_page_offset);
 }
 
 void DataPage::SetPrevPageId(PageId page_id)
 {
+    assert(cached_ == nullptr);
     EncodeFixed32(page_.Ptr() + prev_page_offset, page_id);
 }
 
 void DataPage::SetNextPageId(PageId page_id)
 {
+    assert(cached_ == nullptr);
     EncodeFixed32(page_.Ptr() + next_page_offset, page_id);
 }
 
@@ -83,17 +108,32 @@ PageId DataPage::GetPageId() const
 
 char *DataPage::PagePtr() const
 {
-    return page_.Ptr();
+    return cached_ != nullptr ? cached_->PagePtr() : page_.Ptr();
 }
 
 void DataPage::SetPage(Page page)
 {
+    if (cached_ != nullptr)
+    {
+        cached_->Unpin();
+        cached_ = nullptr;
+    }
     page_ = std::move(page);
 }
 
 void DataPage::Clear()
 {
+    if (cached_ != nullptr)
+    {
+        cached_->Unpin();
+        cached_ = nullptr;
+    }
     page_.Free();
+}
+
+bool DataPage::IsRegistered() const
+{
+    return cached_ != nullptr ? cached_->IsRegistered() : page_.IsRegistered();
 }
 
 std::ostream &operator<<(std::ostream &out, DataPage const &page)
@@ -158,6 +198,11 @@ std::string_view DataPageIter::Value() const
 bool DataPageIter::IsOverflow() const
 {
     return overflow_;
+}
+
+bool DataPageIter::IsLargeValue() const
+{
+    return large_value_;
 }
 
 compression::CompressionType DataPageIter::CompressionType() const
@@ -288,7 +333,7 @@ std::pair<bool, uint16_t> DataPageIter::SearchRegion(std::string_view key) const
         size_t mid = left + step;
         uint16_t region_offset = RestartOffset(mid);
         uint32_t shared, non_shared, val_len;
-        bool overflow, expire;
+        bool overflow, expire, large_val;
         compression::CompressionType compression_kind;
         const char *key_ptr = DecodeEntry(page_.data() + region_offset,
                                           page_.data() + restart_offset_,
@@ -297,6 +342,7 @@ std::pair<bool, uint16_t> DataPageIter::SearchRegion(std::string_view key) const
                                           &val_len,
                                           &overflow,
                                           &expire,
+                                          &large_val,
                                           &compression_kind);
         assert(key_ptr != nullptr && shared == 0);
 
@@ -360,6 +406,7 @@ bool DataPageIter::ParseNextKey()
                      &value_len,
                      &overflow_,
                      &has_expire_ts,
+                     &large_value_,
                      &compression_type_);
 
     if (pt == nullptr || key_.size() < shared)
@@ -418,6 +465,7 @@ void DataPageIter::Invalidate()
     expire_ts_ = 0;
     timestamp_ = 0;
     overflow_ = false;
+    large_value_ = false;
     compression_type_ = compression::CompressionType::None;
 }
 
@@ -429,6 +477,7 @@ const char *DataPageIter::DecodeEntry(
     uint32_t *value_length,
     bool *overflow,
     bool *expire,
+    bool *large_value,
     compression::CompressionType *compression_type)
 {
     if (limit - p < 3)
@@ -456,8 +505,18 @@ const char *DataPageIter::DecodeEntry(
     uint8_t compressed =
         *value_length >> uint8_t(ValLenBit::DictionaryCompressed) & 0b11;
 
-    CHECK(compressed != 0b11) << "Data is corrupted";
-    *compression_type = static_cast<compression::CompressionType>(compressed);
+    // 0b11 denotes a very large string stored in segment files.
+    if (compressed == 0b11)
+    {
+        *large_value = true;
+        *compression_type = compression::CompressionType::None;
+    }
+    else
+    {
+        *large_value = false;
+        *compression_type =
+            static_cast<compression::CompressionType>(compressed);
+    }
 
     *value_length >>= uint8_t(ValLenBit::BitsCount);
 

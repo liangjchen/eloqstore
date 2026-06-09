@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "coding.h"
-#include "storage/index_page_manager.h"
+#include "storage/page_manager.h"
 #include "storage/page_mapper.h"
 #include "types.h"
 
@@ -68,8 +68,17 @@ void ManifestBuilder::AppendBranchManifestMetadata(
     uint32_t mapping_len =
         static_cast<uint32_t>(buff_.size() - header_bytes - 4);
     EncodeFixed32(buff_.data() + header_bytes, mapping_len);
-    // append the serialized branch_metadata
+    // append branch_metadata with Fixed32 length prefix so replayer can skip it
+    uint32_t branch_meta_len = static_cast<uint32_t>(branch_metadata.size());
+    size_t branch_len_offset = buff_.size();
+    buff_.resize(buff_.size() + 4);
     buff_.append(branch_metadata);
+    EncodeFixed32(buff_.data() + branch_len_offset, branch_meta_len);
+}
+
+void ManifestBuilder::AppendSegmentMapping(std::string_view segment_mapping)
+{
+    buff_.append(segment_mapping);
 }
 
 std::string_view ManifestBuilder::Snapshot(
@@ -78,15 +87,10 @@ std::string_view ManifestBuilder::Snapshot(
     const MappingSnapshot *mapping,
     FilePageId max_fp_id,
     std::string_view dict_bytes,
-    const BranchManifestMetadata &branch_metadata)
+    const BranchManifestMetadata &branch_metadata,
+    const MappingSnapshot *segment_mapping,
+    FilePageId max_segment_fp_id)
 {
-    // For snapshot, the structure is:
-    // Checksum(8B) | Root(4B) | TTL Root(4B) | Payload Len(4B) |
-    // MaxFpId(8B) | DictLen(4B) | dict_bytes(bytes) | mapping_len(4B) |
-    // mapping_tbl(varint64...) | branch_metadata
-    //
-    // branch_metadata = branch_name_len(4B) + branch_name + term(8B) +
-    // BranchFileMapping
     std::string branch_metadata_str =
         SerializeBranchManifestMetadata(branch_metadata);
 
@@ -105,8 +109,25 @@ std::string_view ManifestBuilder::Snapshot(
     uint32_t mapping_bytes_len =
         static_cast<uint32_t>(buff_.size() - mapping_bytes_len_offset - 4);
     EncodeFixed32(buff_.data() + mapping_bytes_len_offset, mapping_bytes_len);
-    // branch_metadata
+    // branch_metadata: Fixed32 length prefix so the replayer can skip it
+    uint32_t branch_meta_len =
+        static_cast<uint32_t>(branch_metadata_str.size());
+    size_t branch_len_offset = buff_.size();
+    buff_.resize(buff_.size() + 4);
     buff_.append(branch_metadata_str);
+    EncodeFixed32(buff_.data() + branch_len_offset, branch_meta_len);
+    // segment mapping section (omitted entirely when no segment mapping exists)
+    if (segment_mapping != nullptr)
+    {
+        buff_.AppendVarint64(max_segment_fp_id);
+        size_t seg_mapping_bytes_len_offset = buff_.size();
+        buff_.resize(buff_.size() + 4);
+        segment_mapping->Serialize(buff_);
+        uint32_t seg_mapping_bytes_len = static_cast<uint32_t>(
+            buff_.size() - seg_mapping_bytes_len_offset - 4);
+        EncodeFixed32(buff_.data() + seg_mapping_bytes_len_offset,
+                      seg_mapping_bytes_len);
+    }
     return Finalize(root_id, ttl_root);
 }
 
@@ -179,7 +200,7 @@ uint64_t ManifestBuilder::CalcChecksum(std::string_view content)
     return agg_checksum;
 }
 
-RootMetaMgr::RootMetaMgr(IndexPageManager *owner, const KvOptions *options)
+RootMetaMgr::RootMetaMgr(PageManager *owner, const KvOptions *options)
     : owner_(owner), options_(options)
 {
     capacity_bytes_ = options_->root_meta_cache_size;
@@ -194,6 +215,7 @@ RootMetaMgr::RootMetaMgr(IndexPageManager *owner, const KvOptions *options)
 std::pair<RootMetaMgr::Entry *, bool> RootMetaMgr::GetOrCreate(
     const TableIdent &tbl_id)
 {
+    ProcessPendingErase();
     auto [it, inserted] = entries_.try_emplace(tbl_id);
     Entry *entry = &it->second;
     if (inserted)
@@ -209,6 +231,7 @@ std::pair<RootMetaMgr::Entry *, bool> RootMetaMgr::GetOrCreate(
 
 RootMetaMgr::Entry *RootMetaMgr::Find(const TableIdent &tbl_id)
 {
+    ProcessPendingErase();
     auto it = entries_.find(tbl_id);
     if (it == entries_.end())
     {
@@ -243,6 +266,12 @@ void RootMetaMgr::Pin(Entry *entry)
     entry->meta_.ref_cnt_++;
 }
 
+static bool IsMetaEmpty(const RootMeta &meta)
+{
+    return meta.root_id_ == MaxPageId && meta.ttl_root_id_ == MaxPageId &&
+           meta.mapper_ == nullptr && meta.manifest_size_ == 0;
+}
+
 void RootMetaMgr::Unpin(Entry *entry)
 {
     assert(entry->meta_.ref_cnt_ > 0);
@@ -250,7 +279,24 @@ void RootMetaMgr::Unpin(Entry *entry)
     if (entry->meta_.ref_cnt_ == 0)
     {
         EnqueueFront(entry);
+        if (IsMetaEmpty(entry->meta_))
+        {
+            pending_erase_.push_back(entry->tbl_id_);
+        }
     }
+}
+
+void RootMetaMgr::ProcessPendingErase()
+{
+    if (pending_erase_.empty())
+    {
+        return;
+    }
+    for (const TableIdent &tbl_id : pending_erase_)
+    {
+        Erase(tbl_id);
+    }
+    pending_erase_.clear();
 }
 
 void RootMetaMgr::UpdateBytes(Entry *entry, size_t bytes)
@@ -278,38 +324,24 @@ bool RootMetaMgr::EvictRootForCache(Entry *entry)
                               << " table " << tbl_id;
     if (meta.mapper_ == nullptr)
     {
-        CHECK(meta.index_pages_.empty())
+        CHECK(meta.cached_pages_.empty())
             << "EvictRootForCache: mapper null but index pages exist for table "
             << tbl_id;
         LOG(INFO) << "EvictRootForCache: mapper null table " << tbl_id;
         return true;
     }
-    for (MemIndexPage *page : meta.index_pages_)
+    for (MemCachedPage *page : meta.cached_pages_)
     {
         CHECK(!page->IsPinned())
             << "EvictRootForCache: index page pinned table " << tbl_id;
     }
-    if (meta.mapper_->MappingCount() == 0 && meta.manifest_size_ > 0)
-    {
-        meta.locked_ = true;
-        LOG(INFO) << "Evicting manifest for table " << tbl_id << " size "
-                  << meta.manifest_size_;
-        KvError err = owner_->IoMgr()->CleanManifest(tbl_id);
-        if (err != KvError::NoError)
-        {
-            LOG(WARNING) << "Failed to clean manifest for table " << tbl_id
-                         << ": " << ErrorString(err);
-        }
-        meta.waiting_.WakeAll();
-    }
-
-    std::vector<MemIndexPage *> pages(meta.index_pages_.begin(),
-                                      meta.index_pages_.end());
-    for (MemIndexPage *page : pages)
+    std::vector<MemCachedPage *> pages(meta.cached_pages_.begin(),
+                                       meta.cached_pages_.end());
+    for (MemCachedPage *page : pages)
     {
         owner_->RecyclePage(page);
     }
-    meta.index_pages_.clear();
+    meta.cached_pages_.clear();
     return true;
 }
 
@@ -323,8 +355,14 @@ void RootMetaMgr::ReleaseMappers()
             snapshot->idx_mgr_ = nullptr;
         }
         meta.mapping_snapshots_.clear();
-        meta.index_pages_.clear();
+        for (MappingSnapshot *snapshot : meta.segment_mapping_snapshots_)
+        {
+            snapshot->idx_mgr_ = nullptr;
+        }
+        meta.segment_mapping_snapshots_.clear();
+        meta.cached_pages_.clear();
         meta.mapper_ = nullptr;
+        meta.segment_mapper_ = nullptr;
     }
 }
 

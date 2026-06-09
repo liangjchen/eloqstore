@@ -15,8 +15,8 @@
 #include "error.h"
 #include "file_gc.h"
 #include "storage/data_page.h"
-#include "storage/index_page_manager.h"
-#include "storage/mem_index_page.h"
+#include "storage/mem_cached_page.h"
+#include "storage/page_manager.h"
 #include "storage/page_mapper.h"
 #include "storage/shard.h"
 #include "types.h"
@@ -28,16 +28,27 @@ namespace
 {
 KvError BuildRetainedFiles(const TableIdent &tbl_id,
                            RetainedFiles &retained_files,
-                           std::vector<MappingSnapshot::Ref> &snapshot_array)
+                           std::vector<MappingSnapshot::Ref> &snapshot_array,
+                           bool is_segment)
 {
     auto [root_handle, err] = shard->IndexManager()->FindRoot(tbl_id);
+    if (err == KvError::NotFound)
+    {
+        // Partition has no valid RootMeta (e.g. after Drop cleared it, or
+        // manifest was deleted).  There are no retained files.
+        retained_files.clear();
+        return KvError::NoError;
+    }
     CHECK_KV_ERR(err);
     RootMeta *meta = root_handle.Get();
-    const uint8_t shift = Options()->pages_per_file_shift;
+    const auto &snapshots = is_segment ? meta->segment_mapping_snapshots_
+                                       : meta->mapping_snapshots_;
+    const uint8_t shift = is_segment ? Options()->segments_per_file_shift
+                                     : Options()->pages_per_file_shift;
     size_t approx_file_cnt = 0;
     snapshot_array.clear();
-    snapshot_array.reserve(meta->mapping_snapshots_.size());
-    for (MappingSnapshot *mapping : meta->mapping_snapshots_)
+    snapshot_array.reserve(snapshots.size());
+    for (MappingSnapshot *mapping : snapshots)
     {
         const size_t page_cnt = mapping->mapping_tbl_.size();
         const size_t file_cnt = (page_cnt >> shift) + 1;
@@ -54,7 +65,8 @@ KvError BuildRetainedFiles(const TableIdent &tbl_id,
         IoMgr()->GetBranchFileMapping(tbl_id);
     for (const MappingSnapshot::Ref &mapping : snapshot_array)
     {
-        GetRetainedFiles(file_keys, mapping->mapping_tbl_, file_ranges, shift);
+        GetRetainedFiles(
+            file_keys, mapping->mapping_tbl_, file_ranges, shift, is_segment);
         ThdTask()->YieldToLowPQ();
     }
 
@@ -167,7 +179,9 @@ void WriteTask::Reset(const TableIdent &tbl_id)
     need_wait_dir_eviction_ = IoMgr()->IsDirEvicting(tbl_ident_);
     write_err_ = KvError::NoError;
     wal_builder_.Reset();
+    seg_mapping_deltas_.clear();
     last_append_file_id_.reset();
+    last_seen_segment_file_id_.reset();
     cow_meta_ = CowRootMeta();
     size_t buf_size = Options()->write_buffer_size;
     if (buf_size == 0)
@@ -201,6 +215,7 @@ void WriteTask::Abort()
     }
     cow_meta_ = CowRootMeta();
     last_append_file_id_.reset();
+    last_seen_segment_file_id_.reset();
     pending_upload_tasks_.clear();
     ResetUploadState();
     ReleaseDirBusy();
@@ -209,7 +224,31 @@ void WriteTask::Abort()
 KvError WriteTask::WritePage(DataPage &&page)
 {
     SetChecksum({page.PagePtr(), Options()->data_page_size});
-    auto [_, fp_id] = AllocatePage(page.GetPageId());
+    auto [pid, fp_id] = AllocatePage(page.GetPageId());
+
+    if (Options()->enable_data_page_cache)
+    {
+        // Promote the just-written data page into the cache by routing through
+        // the same Handle-based path index-page writes use: a successful
+        // WritePageCallback for VarPageType::MemCachedPage runs FinishIo,
+        // which AddSwizzling's the page into the new mapping and enqueues it
+        // on the LRU. The next reader on this PageId then sees a cache hit
+        // instead of faulting to disk.
+        PageManager *mgr = shard->IndexManager();
+        MemCachedPage *m = mgr->AllocPage();
+        if (m != nullptr)
+        {
+            m->SetPage(page.ExtractPage());
+            m->SetPageId(pid);
+            m->SetFilePageId(fp_id);
+            MemCachedPage::Handle handle(m);
+            return WritePage(VarPage(std::move(handle)), fp_id);
+        }
+        // Cache slot unavailable (full and nothing evictable). Fall through
+        // to the un-promoted write; `page` still owns its buffer because
+        // ExtractPage() wasn't called.
+    }
+
     return WritePage(std::move(page), fp_id);
 }
 
@@ -220,7 +259,7 @@ KvError WriteTask::WritePage(OverflowPage &&page)
     return WritePage(std::move(page), fp_id);
 }
 
-KvError WriteTask::WritePage(MemIndexPage::Handle &page)
+KvError WriteTask::WritePage(MemCachedPage::Handle &page)
 {
     SetChecksum({page->PagePtr(), Options()->data_page_size});
     auto [page_id, file_page_id] = AllocatePage(page->GetPageId());
@@ -229,12 +268,12 @@ KvError WriteTask::WritePage(MemIndexPage::Handle &page)
     return WritePage(page, file_page_id);
 }
 
-KvError WriteTask::WritePage(MemIndexPage::Handle &page,
+KvError WriteTask::WritePage(MemCachedPage::Handle &page,
                              FilePageId file_page_id)
 {
     SetChecksum({page->PagePtr(), Options()->data_page_size});
     // Create a temporary handle for VarPage to keep pinning during IO.
-    MemIndexPage::Handle io_handle(page.Get());
+    MemCachedPage::Handle io_handle(page.Get());
     return WritePage(VarPage(std::move(io_handle)), file_page_id);
 }
 
@@ -299,7 +338,8 @@ KvError WriteTask::AppendWritePage(VarPage page, FilePageId file_page_id)
         // without waiting for cloud completion.
         if (file_switched)
         {
-            KvError err = IoMgr()->OnDataFileSealed(tbl_ident_, sealed_file_id);
+            KvError err = IoMgr()->OnDataFileSealed(
+                tbl_ident_, DataFileKey(sealed_file_id));
             CHECK_KV_ERR(err);
         }
         uint16_t buf_index = 0;
@@ -349,7 +389,7 @@ void WriteTask::FlushAppendWrites()
     }
 
     KvError err = IoMgr()->SubmitMergedWrite(tbl_ident_,
-                                             batch.file_id,
+                                             DataFileKey(batch.file_id),
                                              batch.start_offset,
                                              batch.buffer,
                                              batch.bytes,
@@ -410,10 +450,10 @@ void WriteTask::WritePageCallback(VarPage page, KvError err)
 
     switch (VarPageType(page.index()))
     {
-    case VarPageType::MemIndexPage:
+    case VarPageType::MemCachedPage:
     {
-        MemIndexPage::Handle &handle = std::get<MemIndexPage::Handle>(page);
-        MemIndexPage *idx_page = handle.Get();
+        MemCachedPage::Handle &handle = std::get<MemCachedPage::Handle>(page);
+        MemCachedPage *idx_page = handle.Get();
         if (err == KvError::NoError)
         {
             shard->IndexManager()->FinishIo(cow_meta_.mapper_->GetMapping(),
@@ -426,7 +466,7 @@ void WriteTask::WritePageCallback(VarPage page, KvError err)
             {
                 handle.Reset();
                 CHECK(!idx_page->IsPinned());
-                shard->IndexManager()->FreeIndexPage(idx_page);
+                shard->IndexManager()->FreePage(idx_page);
             }
         }
         break;
@@ -452,16 +492,39 @@ KvError WriteTask::WaitWrite()
 
 std::pair<PageId, FilePageId> WriteTask::AllocatePage(PageId page_id)
 {
-    if (!Options()->data_append_mode && page_id != MaxPageId)
+    if (page_id != MaxPageId)
     {
-        FilePageId old_fp_id = ToFilePage(page_id);
-        if (old_fp_id != MaxFilePageId)
+        if (!Options()->data_append_mode)
         {
-            // The page is mapped to a new file page. The old file page will be
-            // recycled. However, the old file page shall only be recycled when
-            // the old mapping snapshot is destructed, i.e., no one is using the
-            // old mapping.
-            cow_meta_.old_mapping_->AddFreeFilePage(old_fp_id);
+            FilePageId old_fp_id = ToFilePage(page_id);
+            if (old_fp_id != MaxFilePageId)
+            {
+                // The page is mapped to a new file page. The old file page
+                // will be recycled. However, the old file page shall only be
+                // recycled when the old mapping snapshot is destructed, i.e.,
+                // no one is using the old mapping.
+                cow_meta_.old_mapping_->AddFreeFilePage(old_fp_id);
+            }
+        }
+        // UpdateMapping below overwrites the swizzling pointer in the new
+        // snapshot, leaving the cached page referenced only by the old
+        // snapshot. This happens in both CoW and append modes -- the mapping
+        // entry is rewritten regardless of how the file page is allocated.
+        // If no reader is pinning it, reclaim its slot now rather than wait
+        // for LRU to notice it. The size guard skips PageIds that were
+        // allocated by this writer (extending the new mapping past the old
+        // mapping's table size).
+        if (cow_meta_.old_mapping_ != nullptr &&
+            page_id < cow_meta_.old_mapping_->mapping_tbl_.size())
+        {
+            MemCachedPage::Handle h =
+                cow_meta_.old_mapping_->GetSwizzlingHandle(page_id);
+            if (h)
+            {
+                MemCachedPage *cached = h.Get();
+                h.Reset();
+                shard->IndexManager()->TryRecycleCachedPage(cached);
+            }
         }
     }
 
@@ -477,24 +540,76 @@ std::pair<PageId, FilePageId> WriteTask::AllocatePage(PageId page_id)
         cow_meta_.mapper_->FilePgAllocator()->CurrentFileId();
     std::string unused_branch;
     uint64_t unused_term;
-    if (!IoMgr()->GetBranchNameAndTerm(
-            tbl_ident_, file_id_before_allocate, unused_branch, unused_term))
+    if (!IoMgr()->GetBranchNameAndTerm(tbl_ident_,
+                                       DataFileKey(file_id_before_allocate),
+                                       unused_branch,
+                                       unused_term))
     {
         IoMgr()->SetBranchFileIdTerm(tbl_ident_,
-                                     file_id_before_allocate,
+                                     DataFileKey(file_id_before_allocate),
                                      IoMgr()->GetActiveBranch(),
                                      IoMgr()->ProcessTerm());
     }
     if (file_id_before_allocate != file_id_after_allocate)
     {
         IoMgr()->SetBranchFileIdTerm(tbl_ident_,
-                                     file_id_after_allocate,
+                                     DataFileKey(file_id_after_allocate),
                                      IoMgr()->GetActiveBranch(),
                                      IoMgr()->ProcessTerm());
     }
 
     cow_meta_.mapper_->UpdateMapping(page_id, file_page_id);
     wal_builder_.UpdateMapping(page_id, file_page_id);
+    return {page_id, file_page_id};
+}
+
+std::pair<PageId, FilePageId> WriteTask::AllocateSegment(PageId page_id)
+{
+    PageMapper *seg_mapper = cow_meta_.segment_mapper_.get();
+    CHECK(seg_mapper != nullptr);
+    if (page_id == MaxPageId)
+    {
+        page_id = seg_mapper->GetPage();
+    }
+
+    FileId file_id_before = seg_mapper->FilePgAllocator()->CurrentFileId();
+    FilePageId file_page_id = seg_mapper->FilePgAllocator()->Allocate();
+    FileId file_id_after = seg_mapper->FilePgAllocator()->CurrentFileId();
+
+    // After a restart with a new term, the allocator is bumped to a new file
+    // whose (branch, term) hasn't been recorded yet. Stamp it on first
+    // allocation so the BranchFileMapping carries segment-file ranges.
+    // Cache the last file id we verified/stamped so consecutive same-file
+    // allocations skip the hash-map lookup -- mirrors last_append_file_id_
+    // for the data-file path in WritePage.
+    if (!last_seen_segment_file_id_.has_value() ||
+        *last_seen_segment_file_id_ != file_id_before)
+    {
+        std::string unused_branch;
+        uint64_t unused_term;
+        if (!IoMgr()->GetBranchNameAndTerm(tbl_ident_,
+                                           SegmentFileKey(file_id_before),
+                                           unused_branch,
+                                           unused_term))
+        {
+            IoMgr()->SetBranchFileIdTerm(tbl_ident_,
+                                         SegmentFileKey(file_id_before),
+                                         IoMgr()->GetActiveBranch(),
+                                         IoMgr()->ProcessTerm());
+        }
+        last_seen_segment_file_id_ = file_id_before;
+    }
+    if (file_id_before != file_id_after)
+    {
+        IoMgr()->SetBranchFileIdTerm(tbl_ident_,
+                                     SegmentFileKey(file_id_after),
+                                     IoMgr()->GetActiveBranch(),
+                                     IoMgr()->ProcessTerm());
+        last_seen_segment_file_id_ = file_id_after;
+    }
+
+    seg_mapper->UpdateMapping(page_id, file_page_id);
+    RecordSegmentMappingUpdate(page_id, file_page_id);
     return {page_id, file_page_id};
 }
 
@@ -506,6 +621,23 @@ void WriteTask::FreePage(PageId page_id)
         FilePageId file_page = ToFilePage(page_id);
         cow_meta_.old_mapping_->AddFreeFilePage(file_page);
     }
+    // The PageId is being permanently freed; the cached page (if any) is
+    // about to be orphaned by FreePage() below, which overwrites any
+    // swizzling pointer in the new snapshot. The orphan situation is
+    // independent of append mode -- only the file-page freeing above is.
+    // The size guard skips PageIds that aren't in the old mapping's table.
+    if (cow_meta_.old_mapping_ != nullptr &&
+        page_id < cow_meta_.old_mapping_->mapping_tbl_.size())
+    {
+        MemCachedPage::Handle h =
+            cow_meta_.old_mapping_->GetSwizzlingHandle(page_id);
+        if (h)
+        {
+            MemCachedPage *cached = h.Get();
+            h.Reset();
+            shard->IndexManager()->TryRecycleCachedPage(cached);
+        }
+    }
     cow_meta_.mapper_->FreePage(page_id);
     wal_builder_.DeleteMapping(page_id);
 }
@@ -513,6 +645,20 @@ void WriteTask::FreePage(PageId page_id)
 FilePageId WriteTask::ToFilePage(PageId page_id)
 {
     return cow_meta_.mapper_->GetMapping()->ToFilePage(page_id);
+}
+
+void WriteTask::RecordSegmentMappingUpdate(PageId page_id,
+                                           FilePageId file_page_id)
+{
+    PutVarint32(&seg_mapping_deltas_, page_id);
+    PutVarint64(&seg_mapping_deltas_,
+                MappingSnapshot::EncodeFilePageId(file_page_id));
+}
+
+void WriteTask::RecordSegmentMappingDelete(PageId page_id)
+{
+    PutVarint32(&seg_mapping_deltas_, page_id);
+    PutVarint64(&seg_mapping_deltas_, MappingSnapshot::InvalidValue);
 }
 
 KvError WriteTask::FlushManifest()
@@ -547,22 +693,38 @@ KvError WriteTask::FlushManifest()
     branch_metadata.file_ranges = IoMgr()->GetBranchFileMapping(tbl_ident_);
     YieldToLowPQ();
 
+    // Prepare data and segment mapping parameters for manifest serialization.
+    MappingSnapshot *mapping = cow_meta_.mapper_->GetMapping();
+    FilePageId max_fp_id =
+        cow_meta_.mapper_->FilePgAllocator()->MaxFilePageId();
+    MappingSnapshot *seg_mapping = cow_meta_.segment_mapper_
+                                       ? cow_meta_.segment_mapper_->GetMapping()
+                                       : nullptr;
+    FilePageId max_seg_fp_id =
+        cow_meta_.segment_mapper_
+            ? cow_meta_.segment_mapper_->FilePgAllocator()->MaxFilePageId()
+            : 0;
+
+    const size_t seg_delta_section_size =
+        sizeof(uint32_t) + seg_mapping_deltas_.size();
+
     if (need_empty_snapshot)
     {
         // Write a snapshot with empty roots and empty mapping
-        MappingSnapshot *mapping = cow_meta_.mapper_->GetMapping();
-        FilePageId max_fp_id =
-            cow_meta_.mapper_->FilePgAllocator()->MaxFilePageId();
         std::string_view snapshot =
             wal_builder_.Snapshot(cow_meta_.root_id_,
                                   cow_meta_.ttl_root_id_,
                                   mapping,
                                   max_fp_id,
                                   dict_bytes,
-                                  branch_metadata);
+                                  branch_metadata,
+                                  seg_mapping,
+                                  max_seg_fp_id);
         err = IoMgr()->SwitchManifest(tbl_ident_, snapshot);
         CHECK_KV_ERR(err);
         cow_meta_.manifest_size_ = snapshot.size();
+        cow_meta_.first_unflushed_fp_id_ = max_fp_id;
+        cow_meta_.first_unflushed_seg_fp_id_ = max_seg_fp_id;
         cow_meta_.compression_->ClearDirty();
         return KvError::NoError;
     }
@@ -576,16 +738,24 @@ KvError WriteTask::FlushManifest()
     // CurrentSize() already accounts for the 4-byte mapping_len field
     // (resized_for_mapping_bytes_len_ is always true here because Empty()
     // returned false above, meaning at least one mapping entry was appended).
+    // Branch metadata is appended with a Fixed32 length prefix in
+    // AppendBranchManifestMetadata, so account for those 4 extra bytes here.
     const uint64_t log_physical_size =
-        (wal_builder_.CurrentSize() + branch_metadata_str.size() + alignment -
-         1) &
+        (wal_builder_.CurrentSize() + sizeof(uint32_t) +
+         branch_metadata_str.size() + seg_delta_section_size + alignment - 1) &
         ~(alignment - 1);
 
     if (!dict_dirty && manifest_size > 0 &&
         manifest_size + log_physical_size <= opts->manifest_limit)
     {
-        // Append branch metadata to manifest log
+        // Append branch metadata (with Fixed32 length prefix) and segment
+        // mapping deltas (also length-prefixed) to the manifest log.
         wal_builder_.AppendBranchManifestMetadata(branch_metadata_str);
+        char seg_len_buf[sizeof(uint32_t)];
+        EncodeFixed32(seg_len_buf,
+                      static_cast<uint32_t>(seg_mapping_deltas_.size()));
+        wal_builder_.AppendSegmentMapping({seg_len_buf, sizeof(seg_len_buf)});
+        wal_builder_.AppendSegmentMapping(seg_mapping_deltas_);
         std::string_view blob =
             wal_builder_.Finalize(cow_meta_.root_id_, cow_meta_.ttl_root_id_);
         err = IoMgr()->AppendManifest(tbl_ident_, blob, manifest_size);
@@ -593,22 +763,25 @@ KvError WriteTask::FlushManifest()
         // Use the actual blob size (aligned) to keep manifest_size_ accurate.
         cow_meta_.manifest_size_ +=
             (blob.size() + alignment - 1) & ~(alignment - 1);
+        cow_meta_.first_unflushed_fp_id_ = max_fp_id;
+        cow_meta_.first_unflushed_seg_fp_id_ = max_seg_fp_id;
     }
     else
     {
-        MappingSnapshot *mapping = cow_meta_.mapper_->GetMapping();
-        FilePageId max_fp_id =
-            cow_meta_.mapper_->FilePgAllocator()->MaxFilePageId();
         std::string_view snapshot =
             wal_builder_.Snapshot(cow_meta_.root_id_,
                                   cow_meta_.ttl_root_id_,
                                   mapping,
                                   max_fp_id,
                                   dict_bytes,
-                                  branch_metadata);
+                                  branch_metadata,
+                                  seg_mapping,
+                                  max_seg_fp_id);
         err = IoMgr()->SwitchManifest(tbl_ident_, snapshot);
         CHECK_KV_ERR(err);
         cow_meta_.manifest_size_ = snapshot.size();
+        cow_meta_.first_unflushed_fp_id_ = max_fp_id;
+        cow_meta_.first_unflushed_seg_fp_id_ = max_seg_fp_id;
         cow_meta_.compression_->ClearDirty();
     }
     return KvError::NoError;
@@ -620,7 +793,7 @@ KvError WriteTask::DeleteArchive(uint64_t term, std::string_view tag)
         tbl_ident_, IoMgr()->GetActiveBranch(), term, tag);
 }
 
-KvError WriteTask::UpdateMeta()
+KvError WriteTask::UpdateMeta(bool trigger_compact)
 {
     // Flush data pages.
     KvError err = WaitWrite();
@@ -636,40 +809,77 @@ KvError WriteTask::UpdateMeta()
     err = FlushManifest();
     CHECK_KV_ERR(err);
 
-    // Hooks after modified partition.
-    CompactIfNeeded(cow_meta_.mapper_.get());
+    // Hooks after modified partition. Each mapping is evaluated against its
+    // own amplify factor; the overflow signal itself remains coarse — a single
+    // shard->AddPendingCompact(tbl_ident_) covers both. The background handler
+    // re-evaluates allocator stats to decide which pass(es) to run.
+    //
+    // Data pages only participate when the partition is in data-append mode
+    // (the allocator isn't an AppendAllocator otherwise). Segments always use
+    // an AppendAllocator via EnsureSegmentMapper, so segment compaction can
+    // fire even in non-append-mode partitions that happen to hold very-large
+    // values.
+    if (trigger_compact)
+    {
+        const KvOptions *opts = Options();
+        if (opts->data_append_mode)
+        {
+            CompactIfNeeded(cow_meta_.mapper_.get(), opts->file_amplify_factor);
+        }
+        if (cow_meta_.segment_mapper_ != nullptr)
+        {
+            CompactIfNeeded(cow_meta_.segment_mapper_.get(),
+                            opts->segment_file_amplify_factor);
+        }
+    }
 
     shard->IndexManager()->UpdateRoot(tbl_ident_, std::move(cow_meta_));
     return KvError::NoError;
 }
 
-void WriteTask::CompactIfNeeded(PageMapper *mapper) const
+void WriteTask::CompactIfNeeded(PageMapper *mapper,
+                                uint32_t amplify_factor) const
 {
-    const KvOptions *opts = Options();
-    if (!opts->data_append_mode || opts->file_amplify_factor == 0 ||
-        Type() != TaskType::BatchWrite || shard->HasPendingCompact(tbl_ident_))
+    if (shard->HasPendingCompact(tbl_ident_))
     {
         return;
     }
+    if (MapperExceedsAmplification(mapper, amplify_factor))
+    {
+        shard->AddPendingCompact(tbl_ident_);
+    }
+}
 
-    auto allocator = static_cast<AppendAllocator *>(mapper->FilePgAllocator());
+bool WriteTask::MapperExceedsAmplification(const PageMapper *mapper,
+                                           uint32_t amp_factor)
+{
+    if (mapper == nullptr || amp_factor == 0)
+    {
+        return false;
+    }
+    // Allocator is always AppendAllocator here: the data-mapper caller gates
+    // on opts->data_append_mode, and segment mappers are constructed with an
+    // AppendAllocator in EnsureSegmentMapper.
+    auto *alloc = dynamic_cast<AppendAllocator *>(mapper->FilePgAllocator());
+    CHECK(alloc != nullptr)
+        << "MapperExceedsAmplification requires an AppendAllocator";
     uint32_t mapping_cnt = mapper->MappingCount();
-    size_t space_size = allocator->SpaceSize();
+    size_t space_size = alloc->SpaceSize();
     assert(space_size >= mapping_cnt);
     // When both mapping_cnt and space_size are 0, compaction should NOT be
     // triggered. This indicates that the manifest does not exist yet, or the
     // table has not been initialized.
 
     // Two cases trigger compaction:
-    // (1) The table has been completely cleared (mapping_cnt == 0 but
+    // (1) The mapping has been completely cleared (mapping_cnt == 0 but
     // space_size > 0); (2) The space amplification factor has been exceeded.
-    if ((mapping_cnt == 0 && space_size != 0) ||
-        (space_size >= allocator->PagesPerFile() &&
-         static_cast<double>(space_size) / static_cast<double>(mapping_cnt) >
-             static_cast<double>(opts->file_amplify_factor)))
+    if (mapping_cnt == 0)
     {
-        shard->AddPendingCompact(tbl_ident_);
+        return space_size != 0;
     }
+    return space_size >= alloc->PagesPerFile() &&
+           static_cast<double>(space_size) / static_cast<double>(mapping_cnt) >
+               static_cast<double>(amp_factor);
 }
 
 void WriteTask::TriggerTTL()
@@ -702,8 +912,8 @@ void WriteTask::TriggerFileGC() const
 
     RetainedFiles retained_files;
     std::vector<MappingSnapshot::Ref> snapshot_array;
-    KvError build_err =
-        BuildRetainedFiles(tbl_ident_, retained_files, snapshot_array);
+    KvError build_err = BuildRetainedFiles(
+        tbl_ident_, retained_files, snapshot_array, /*is_segment=*/false);
     if (build_err != KvError::NoError)
     {
         LOG(ERROR) << "BuildRetainedFiles failed for table "
@@ -712,8 +922,25 @@ void WriteTask::TriggerFileGC() const
         return;
     }
 
+    // Build retained_segment_files. Resolve each segment's owning (branch,
+    // term) via BranchFileMapping so segments inherited from a parent branch
+    // are retained under the correct identity.
+    RetainedFiles retained_segment_files;
+    std::vector<MappingSnapshot::Ref> seg_snapshot_array;
+    build_err = BuildRetainedFiles(tbl_ident_,
+                                   retained_segment_files,
+                                   seg_snapshot_array,
+                                   /*is_segment=*/true);
+    if (build_err != KvError::NoError)
+    {
+        LOG(ERROR) << "BuildRetainedFiles (segment) failed for table "
+                   << tbl_ident_.ToString()
+                   << " err=" << static_cast<int>(build_err);
+        return;
+    }
+
     // Check if we're in cloud mode or local mode
-    if (!Options()->cloud_store_path.empty())
+    if (eloq_store->Mode() == StoreMode::Cloud)
     {
         // Cloud mode: execute GC directly
         CloudStoreMgr *cloud_mgr =
@@ -725,7 +952,7 @@ void WriteTask::TriggerFileGC() const
         }
 
         KvError gc_err = FileGarbageCollector::ExecuteCloudGC(
-            tbl_ident_, retained_files, cloud_mgr);
+            tbl_ident_, retained_files, retained_segment_files, cloud_mgr);
 
         if (gc_err != KvError::NoError)
         {
@@ -738,7 +965,7 @@ void WriteTask::TriggerFileGC() const
         DLOG(INFO) << "Begin GC in Local mode";
         IouringMgr *io_mgr = static_cast<IouringMgr *>(shard->IoManager());
         KvError gc_err = FileGarbageCollector::ExecuteLocalGC(
-            tbl_ident_, retained_files, io_mgr);
+            tbl_ident_, retained_files, retained_segment_files, io_mgr);
 
         if (gc_err != KvError::NoError)
         {
@@ -752,12 +979,17 @@ KvError WriteTask::TriggerLocalFileGC() const
     assert(Options()->data_append_mode);
     RetainedFiles retained_files;
     std::vector<MappingSnapshot::Ref> snapshot_array;
-    KvError build_err =
-        BuildRetainedFiles(tbl_ident_, retained_files, snapshot_array);
+    KvError build_err = BuildRetainedFiles(
+        tbl_ident_, retained_files, snapshot_array, /*is_segment=*/false);
     CHECK_KV_ERR(build_err);
+
+    // Local GC only runs against data files in this path; segment-file GC is
+    // handled by TriggerFileGC. Pass an empty retained-segment set so the
+    // local GC pass treats segment files as out-of-scope.
+    RetainedFiles retained_segment_files;
     IouringMgr *io_mgr = static_cast<IouringMgr *>(shard->IoManager());
     KvError gc_err = FileGarbageCollector::ExecuteLocalGC(
-        tbl_ident_, retained_files, io_mgr);
+        tbl_ident_, retained_files, retained_segment_files, io_mgr);
     if (gc_err != KvError::NoError)
     {
         LOG(ERROR) << "Local GC failed for table " << tbl_ident_.ToString();
@@ -767,7 +999,13 @@ KvError WriteTask::TriggerLocalFileGC() const
 
 std::pair<DataPage, KvError> WriteTask::LoadDataPage(PageId page_id)
 {
-    return ::eloqstore::LoadDataPage(tbl_ident_, page_id, ToFilePage(page_id));
+    return ::eloqstore::LoadDataPage(cow_meta_.mapper_->GetMapping(), page_id);
+}
+
+std::pair<DataPage, KvError> WriteTask::LoadDataPageForUpdate(PageId page_id)
+{
+    return ::eloqstore::LoadDataPageForUpdate(cow_meta_.mapper_->GetMapping(),
+                                              page_id);
 }
 
 std::pair<OverflowPage, KvError> WriteTask::LoadOverflowPage(PageId page_id)

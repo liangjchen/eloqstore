@@ -15,14 +15,14 @@
 
 #include "coding.h"
 #include "manifest_buffer.h"
-#include "storage/index_page_manager.h"
-#include "storage/mem_index_page.h"
+#include "storage/mem_cached_page.h"
+#include "storage/page_manager.h"
 #include "storage/shard.h"
 #include "tasks/task.h"
 
 namespace eloqstore
 {
-MappingSnapshot::MappingSnapshot(IndexPageManager *idx_mgr,
+MappingSnapshot::MappingSnapshot(PageManager *idx_mgr,
                                  const TableIdent *tbl_id,
                                  MappingTbl tbl)
     : idx_mgr_(idx_mgr), tbl_ident_(tbl_id), mapping_tbl_(std::move(tbl))
@@ -181,6 +181,25 @@ void MappingSnapshot::MappingTbl::CopyFrom(const MappingTbl &src)
         std::memcpy(base_[chunk_idx]->data(),
                     src.base_[chunk_idx]->data(),
                     copy_elems * sizeof(uint64_t));
+        // Swizzling pointers to pages still being loaded (detached)
+        // are unsafe to share across mapping copies: if the loading
+        // task fails, the original unswizzles but the copy is left
+        // with a dangling pointer. Convert detached swizzled pages
+        // back to their file_page_id so the copy never holds a
+        // pointer into an incomplete load window.
+        for (size_t i = 0; i < copy_elems; ++i)
+        {
+            uint64_t &val = (*base_[chunk_idx])[i];
+            if (MappingSnapshot::IsSwizzlingPointer(val))
+            {
+                MemCachedPage *page = reinterpret_cast<MemCachedPage *>(val);
+                if (page->IsDetached())
+                {
+                    val = MappingSnapshot::EncodeFilePageId(
+                        page->GetFilePageId());
+                }
+            }
+        }
         ThdTask()->YieldToLowPQ();
     }
 }
@@ -300,7 +319,7 @@ void MappingSnapshot::MappingTbl::ReleaseChunk(std::unique_ptr<Chunk> chunk)
     }
 }
 
-PageMapper::PageMapper(IndexPageManager *idx_mgr, const TableIdent *tbl_ident)
+PageMapper::PageMapper(PageManager *idx_mgr, const TableIdent *tbl_ident)
 {
     MappingArena *vector_arena = idx_mgr->MapperArena();
     MappingChunkArena *chunk_arena = idx_mgr->MapperChunkArena();
@@ -457,7 +476,7 @@ uint64_t MappingSnapshot::DecodeId(uint64_t val)
 
 MappingSnapshot::~MappingSnapshot()
 {
-    IndexPageManager *mgr = idx_mgr_;
+    PageManager *mgr = idx_mgr_;
     if (mgr == nullptr)
     {
         return;
@@ -482,7 +501,7 @@ FilePageId MappingSnapshot::ToFilePage(uint64_t val) const
     {
     case ValType::SwizzlingPointer:
     {
-        MemIndexPage *idx_page = reinterpret_cast<MemIndexPage *>(val);
+        MemCachedPage *idx_page = reinterpret_cast<MemCachedPage *>(val);
         return idx_page->GetFilePageId();
     }
     case ValType::FilePageId:
@@ -519,7 +538,7 @@ void MappingSnapshot::ClearFreeFilePage()
     to_free_file_pages_.clear();
 }
 
-void MappingSnapshot::Unswizzling(MemIndexPage *page)
+void MappingSnapshot::Unswizzling(MemCachedPage *page)
 {
     PageId page_id = page->GetPageId();
     FilePageId file_page_id = page->GetFilePageId();
@@ -529,26 +548,26 @@ void MappingSnapshot::Unswizzling(MemIndexPage *page)
     {
         uint64_t val = mapping_tbl.Get(page_id);
         if (IsSwizzlingPointer(val) &&
-            reinterpret_cast<MemIndexPage *>(val) == page)
+            reinterpret_cast<MemCachedPage *>(val) == page)
         {
             mapping_tbl.Set(page_id, EncodeFilePageId(file_page_id));
         }
     }
 }
 
-MemIndexPage::Handle MappingSnapshot::GetSwizzlingHandle(PageId page_id) const
+MemCachedPage::Handle MappingSnapshot::GetSwizzlingHandle(PageId page_id) const
 {
     assert(page_id < mapping_tbl_.size());
     uint64_t val = mapping_tbl_.Get(page_id);
     if (IsSwizzlingPointer(val))
     {
-        MemIndexPage *idx_page = reinterpret_cast<MemIndexPage *>(val);
-        return MemIndexPage::Handle(idx_page);
+        MemCachedPage *idx_page = reinterpret_cast<MemCachedPage *>(val);
+        return MemCachedPage::Handle(idx_page);
     }
-    return MemIndexPage::Handle();
+    return MemCachedPage::Handle();
 }
 
-void MappingSnapshot::AddSwizzling(PageId page_id, MemIndexPage *idx_page)
+void MappingSnapshot::AddSwizzling(PageId page_id, MemCachedPage *idx_page)
 {
     auto &mapping_tbl = mapping_tbl_;
     assert(page_id < mapping_tbl.size());
@@ -556,7 +575,7 @@ void MappingSnapshot::AddSwizzling(PageId page_id, MemIndexPage *idx_page)
     uint64_t val = mapping_tbl.Get(page_id);
     if (IsSwizzlingPointer(val))
     {
-        assert(reinterpret_cast<MemIndexPage *>(val) == idx_page);
+        assert(reinterpret_cast<MemCachedPage *>(val) == idx_page);
     }
     else
     {
@@ -589,7 +608,7 @@ void MappingSnapshot::Serialize(ManifestBuffer &dst) const
         uint64_t val = mapping_tbl_.Get(i);
         if (IsSwizzlingPointer(val))
         {
-            MemIndexPage *p = reinterpret_cast<MemIndexPage *>(val);
+            MemCachedPage *p = reinterpret_cast<MemCachedPage *>(val);
             val = EncodeFilePageId(p->GetFilePageId());
         }
         dst.AppendVarint64(val);
@@ -647,7 +666,17 @@ std::unique_ptr<FilePageAllocator> AppendAllocator::Clone()
 void AppendAllocator::UpdateStat(FileId min_file_id, uint32_t hole_cnt)
 {
     assert(min_file_id >= min_file_id_);
-    assert((min_file_id << pages_per_file_shift_) <= max_fp_id_);
+    const FilePageId new_min_fp_id = static_cast<FilePageId>(min_file_id)
+                                     << pages_per_file_shift_;
+    if (new_min_fp_id > max_fp_id_)
+    {
+        // Empty-wipe path: caller is signaling the tail file is also gone
+        // (DoCompact{Data,Segment}File's empty branch — the upcoming GC pass
+        // will delete the tail). Snap max_fp_id_ up to the boundary so
+        // SpaceSize() == 0 and the next Allocate() opens a fresh file rather
+        // than leaving stale tail accounting that re-triggers compaction.
+        max_fp_id_ = new_min_fp_id;
+    }
     min_file_id_ = min_file_id;
     empty_file_cnt_ = hole_cnt;
 }
