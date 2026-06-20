@@ -1,5 +1,6 @@
 #include "tasks/task.h"
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include <cassert>
@@ -16,6 +17,12 @@
 
 namespace eloqstore
 {
+// eloqstore_yield_budget_us is DEFINE_uint64'd in shard.cpp inside namespace
+// eloqstore. The DECLARE must share that namespace: gflags exports
+// FLAGS_<name> relative to the enclosing namespace, so declaring it elsewhere
+// references a different symbol and fails to link.
+DECLARE_uint64(eloqstore_yield_budget_us);
+
 void KvTask::Yield()
 {
     // Check if we're in a valid coroutine context (running_ should be set to
@@ -594,6 +601,21 @@ void Mutex::Unlock()
 KvTask *ThdTask()
 {
     return shard->running_;
+}
+
+void MaybeYield()
+{
+    // Null-safe defensive guard: only yield when a task is actually running on
+    // this shard. Long-running task loops call this; it just keeps the helper
+    // safe to call from any context (a no-op when no task is running).
+    if (shard == nullptr || shard->running_ == nullptr)
+    {
+        return;
+    }
+    if (shard->CurResumeElapsedUs() >= FLAGS_eloqstore_yield_budget_us)
+    {
+        shard->running_->YieldToLowPQ();
+    }
 }
 
 AsyncIoManager *IoMgr()

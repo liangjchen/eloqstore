@@ -66,6 +66,17 @@ public:
     PagesPool *PagePool();
     GlobalRegisteredMemory *GlobalRegMem();
 
+    // Microseconds the currently-running coroutine has held the worker thread
+    // since its last resume (i.e. since its last yield). Long-running task
+    // loops poll this via MaybeYield() and YieldToLowPQ() once it exceeds the
+    // cooperative yield budget, so no single segment holds the brpc worker --
+    // and, in module mode, the Redis request it co-drives -- for much longer
+    // than the budget.
+    uint64_t CurResumeElapsedUs()
+    {
+        return DurationMicroseconds(cur_resume_start_us_);
+    }
+
     std::atomic<bool> io_mgr_and_page_pool_inited_{false};
 
 #ifdef ELOQ_MODULE_ENABLED
@@ -75,6 +86,9 @@ public:
     const size_t shard_id_{0};
     boost::context::continuation main_;
     uint64_t ts_{};
+    // Wall-clock (us) when the currently-running coroutine was last resumed.
+    // Drives CurResumeElapsedUs() for cooperative time-budgeted yielding.
+    uint64_t cur_resume_start_us_{};
     KvTask *running_{};
     CircularQueue<KvTask *> ready_tasks_;
     CircularQueue<KvTask *> low_priority_ready_tasks_;
@@ -120,6 +134,10 @@ private:
         task->needs_auto_reopen_ = false;
         task->needs_oom_retry_ = false;
         running_ = task;
+        // Mark the resume start so a cooperative background loop measures this
+        // first segment from now, not from the previously resumed task's
+        // timestamp (see CurResumeElapsedUs / MaybeYield).
+        cur_resume_start_us_ = ReadTimeMicroseconds();
         task->coro_ = boost::context::callcc(
             std::allocator_arg,
             stack_allocator_,

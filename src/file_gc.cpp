@@ -96,18 +96,24 @@ namespace FileGarbageCollector
 
 namespace
 {
-// For the local active branch, derive the in-flight boundary from the
-// in-memory RootMeta. The boundary is RootMeta::first_unflushed_*_fp_id_,
-// which is the FilePageAllocator's MaxFilePageId() at the moment of the
-// last successful manifest flush -- i.e., the smallest file page id whose
-// allocation was not yet captured by any disk manifest. Converting from
-// page-id space to file-id space yields
-// BranchGuard::least_unflushed_*_file_id_.
-//
-// The on-disk manifest pass that runs after this composes via std::max,
-// so if a non-active branch's disk manifest reaches further, it still
-// wins. retained_files is left entirely to the disk-manifest pass; the
-// in-flight guard alone covers everything past the flushed boundary.
+// Amortized cooperative-yield poll rate for the cheap per-file scan loops
+// (ClassifyFiles / DeleteUnreferenced*): their body is a single filename parse,
+// so calling MaybeYield() -- which reads the clock -- every iteration would be
+// a large fraction of the loop. Poll the budget once per this many iterations
+// instead; the time-based yield still bounds the stall (a few hundred parses is
+// tens of us, vs the tens-of-ms segments this targets). Loops doing a syscall /
+// IO per iteration (ListLocalFiles, manifest replay) keep calling MaybeYield()
+// every iteration -- there the clock read is already negligible.
+constexpr uint64_t kYieldPollStride = 256;
+
+// Seed the active branch's in-flight write guard from the in-memory RootMeta
+// (no disk read). For a live partition the boundary is the data/segment
+// allocator's current MaxFilePageId() in file-id space; a stub RootMeta (no
+// mapper) seeds no guard at all (see the body). The on-disk manifest pass that
+// runs after this composes via std::max, so a non-active branch whose disk
+// manifest reaches further still wins. retained_files is left entirely to the
+// disk-manifest pass; the in-flight guard alone covers everything past the
+// boundary.
 void SeedActiveBranchGuardFromInMemory(const TableIdent &tbl_id,
                                        std::string_view active_branch,
                                        uint64_t process_term,
@@ -124,10 +130,35 @@ void SeedActiveBranchGuardFromInMemory(const TableIdent &tbl_id,
     // No yields between Find() and the field reads below, so the
     // entry cannot be evicted out from under us; no Handle pin needed.
     const RootMeta &meta = entry->meta_;
+    // A stub RootMeta (no data mapper) is a placeholder with no live mapping
+    // and no in-flight writes -- e.g. a partition mid-reopen/drop on a standby.
+    // Seed NO guard for it: its allocators are zero-valued, so a guard would be
+    // least_unflushed=0 and mark every local file "in-flight", protecting
+    // orphaned files from reclamation forever. With no active-branch guard,
+    // DeleteUnreferenced* treats the branch as having a dropped manifest and
+    // reclaims the unretained files (see the missing-guard handling there). A
+    // valid on-disk manifest, if any, still seeds the guard via
+    // ProcessOneManifest.
+    if (meta.mapper_ == nullptr)
+    {
+        return;
+    }
+    // Derive the in-flight boundary from the live allocators rather than the
+    // RootMeta::first_unflushed_*_fp_id_ snapshot fields. Those fields are only
+    // refreshed by a flush whose CoW meta carries the matching mapper, so a
+    // data-only flush leaves first_unflushed_seg_fp_id_ stale (0) even while
+    // segment files exist -- which makes the seeded guard 0 and keeps every
+    // segment file "in-flight", so GC never reclaims dead segments. The live
+    // mapper's allocator MaxFilePageId() is the current high-water and matches
+    // the disk manifest's max_*_file_id_ that ProcessOneManifest would fold in.
     guard.least_unflushed_file_id_ =
-        meta.first_unflushed_fp_id_ >> pages_per_file_shift;
+        meta.mapper_->FilePgAllocator()->MaxFilePageId() >>
+        pages_per_file_shift;
     guard.least_unflushed_seg_file_id_ =
-        meta.first_unflushed_seg_fp_id_ >> segments_per_file_shift;
+        meta.segment_mapper_
+            ? (meta.segment_mapper_->FilePgAllocator()->MaxFilePageId() >>
+               segments_per_file_shift)
+            : 0;
 
     branch_guards.emplace(std::string(active_branch), guard);
 }
@@ -366,6 +397,10 @@ KvError ListLocalFiles(const TableIdent &tbl_id,
         {
             return KvError::NoError;
         }
+        // Synchronous readdir+stat per entry; a partition dir with many data
+        // files can otherwise hold the worker thread for tens of ms in one
+        // uninterrupted segment. Yield once the budget is exceeded.
+        MaybeYield();
         const std::string name = it->path().filename();
         if (boost::algorithm::ends_with(name, TmpSuffix))
         {
@@ -452,8 +487,16 @@ void ClassifyFiles(const std::vector<std::string> &files,
         segment_files->clear();
     }
 
+    uint64_t poll_i = 0;
     for (const std::string &file_name : files)
     {
+        // Per-file CPU parse; with many accumulated files this loop can hold
+        // the worker thread for tens of ms. Poll the yield budget amortized
+        // (kYieldPollStride) so the clock read is not paid on every file.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
         // Ignore temporary files.
         if (boost::algorithm::ends_with(file_name, TmpSuffix))
         {
@@ -632,11 +675,45 @@ KvError AugmentRetainedFilesFromBranchManifests(
     CloudStoreMgr *cloud_mgr =
         is_cloud ? static_cast<CloudStoreMgr *>(io_mgr) : nullptr;
 
+    // Optimization: the active branch's current-term retained files were
+    // already derived from the in-memory mapping by BuildRetainedFiles, and
+    // its in-flight guard by SeedActiveBranchGuardFromInMemory -- and the
+    // in-memory RootMeta is at least as current as the on-disk active-branch
+    // manifest (see the rationale in ExecuteLocalGC step 2a). So re-reading
+    // and replaying the active branch's current manifest from disk here is
+    // pure redundant work -- the dominant GC:Augment cost (manifest replay +
+    // full mapping-table walk on every compaction). Skip it, but ONLY when a
+    // non-stub in-memory RootMeta is present -- the same condition under which
+    // BuildRetainedFiles actually populated retained_files from memory:
+    // FindRoot returns NotFound for a stub RootMeta (mapper_ == nullptr) and
+    // BuildRetainedFiles then leaves the active branch with no retained files,
+    // so matching that predicate here avoids skipping the disk manifest when
+    // memory in fact holds nothing for the active branch. Non-active branches
+    // and archives still go through disk: they may be updated by other
+    // instances and have no trustworthy in-memory mapping here.
+    const std::string_view active_branch = io_mgr->GetActiveBranch();
+    const uint64_t active_term = io_mgr->ProcessTerm();
+    // Pure in-memory, no load/yield: mirror FindRoot's stub detection
+    // (mapper_ == nullptr -> NotFound) without its side effects. No yields
+    // between Find() and the mapper_ read, so the entry cannot be evicted.
+    RootMetaMgr::Entry *active_entry =
+        shard != nullptr
+            ? shard->IndexManager()->RootMetaManager()->Find(tbl_id)
+            : nullptr;
+    const bool active_in_memory =
+        active_entry != nullptr && active_entry->meta_.mapper_ != nullptr;
+
     // --- Process regular manifests ---
     for (size_t i = 0; i < manifest_branch_names.size(); ++i)
     {
+        MaybeYield();
         const std::string &branch = manifest_branch_names[i];
         uint64_t term = manifest_terms[i];
+        if (active_in_memory && term == active_term && branch == active_branch)
+        {
+            // Already covered from memory; avoid the redundant replay.
+            continue;
+        }
         std::string filename = BranchManifestFileName(branch, term);
 
         DirectIoBuffer buf;
@@ -1075,8 +1152,15 @@ KvError DeleteUnreferencedLocalFiles(
     filenames_to_delete.reserve(data_files.size());
     file_ids_to_close.reserve(data_files.size());
 
+    uint64_t poll_i = 0;
     for (const std::string &file_name : data_files)
     {
+        // Cheap per-file parse: amortize the yield-budget check
+        // (kYieldPollStride) instead of reading the clock every iteration.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
         auto ret = ParseFileName(file_name);
         if (ret.first != FileNameData)
         {
@@ -1137,6 +1221,9 @@ KvError DeleteUnreferencedLocalFiles(
                << files_to_delete.size();
     if (!files_to_delete.empty())
     {
+        // Keep the fdatasync (see the matching note in
+        // DeleteUnreferencedLocalSegmentFiles): skipping it makes the stall
+        // ~10x worse via uncontrolled kernel writeback.
         KvError close_err = io_mgr->CloseFiles(tbl_id, file_ids_to_close);
         if (close_err != KvError::NoError)
         {
@@ -1193,8 +1280,15 @@ KvError DeleteUnreferencedLocalSegmentFiles(
     filenames_to_delete.reserve(segment_files.size());
     file_ids_to_close.reserve(segment_files.size());
 
+    uint64_t poll_i = 0;
     for (const std::string &file_name : segment_files)
     {
+        // Cheap per-file parse: amortize the yield-budget check
+        // (kYieldPollStride) instead of reading the clock every iteration.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
         auto ret = ParseFileName(file_name);
         if (ret.first != FileNameSegment)
         {
@@ -1250,6 +1344,13 @@ KvError DeleteUnreferencedLocalSegmentFiles(
         return KvError::NoError;
     }
 
+    // NOTE: keep the fdatasync (CloseFiles unconditionally fdatasyncs dirty
+    // FDs before closing) even though these files are about to be unlinked.
+    // Skipping it does NOT save the I/O -- it lets dirty pages accumulate and
+    // the kernel flushes them in an uncontrolled synchronous burst at
+    // close()/unlink(), which measured ~10x WORSE (one GC segment 365ms vs
+    // 25ms, write-heavy overwrite workload). The explicit batched io_uring
+    // fdatasync here is controlled writeback.
     KvError close_err = io_mgr->CloseFiles(tbl_id, file_ids_to_close);
     if (close_err != KvError::NoError)
     {
@@ -1292,8 +1393,15 @@ KvError DeleteUnreferencedCloudSegmentFiles(
     std::vector<std::string> files_to_delete;
     const uint64_t process_term = cloud_mgr->ProcessTerm();
 
+    uint64_t poll_i = 0;
     for (const std::string &file_name : segment_files)
     {
+        // Cheap per-file parse: amortize the yield-budget check
+        // (kYieldPollStride) instead of reading the clock every iteration.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
         auto ret = ParseFileName(file_name);
         if (ret.first != FileNameSegment)
         {
