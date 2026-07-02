@@ -2,9 +2,13 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
+#include <variant>
 
+#include "async_io_manager.h"
 #include "coding.h"
 #include "compression.h"
 #include "storage/shard.h"
@@ -109,7 +113,7 @@ KvError BatchWriteTask::LoadTripleElement(uint8_t idx, PageId page_id)
         return KvError::NoError;
     }
     assert(page_id != MaxPageId);
-    auto [page, err] = LoadDataPage(page_id);
+    auto [page, err] = LoadDataPageForUpdate(page_id);
     CHECK_KV_ERR(err);
     leaf_triple_[idx] = std::move(page);
     return KvError::NoError;
@@ -236,6 +240,12 @@ void BatchWriteTask::Abort()
     {
         page.Clear();
     }
+    // Defensive: applying_page_ is otherwise only cleared on the next
+    // Reset() when the pooled task is reused. If it ever holds a cached-page
+    // pin (DataPage's cached_ mode), failing to release it here would leave
+    // a cache slot pinned for the entire pool-idle window. Clearing now is
+    // cheap and matches the symmetric treatment of leaf_triple_.
+    applying_page_.Clear();
     ttl_batch_.clear();
 }
 
@@ -243,7 +253,7 @@ KvError BatchWriteTask::Apply()
 {
     // directly go to low priority queue and wait for scheduling
     YieldToLowPQ();
-    KvError err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
+    KvError err = MakeCowRoot();
     cow_meta_.compression_->SampleAndBuildDictionaryIfNeeded(data_batch_);
     CHECK_KV_ERR(err);
     err = ApplyBatch(cow_meta_.root_id_, true);
@@ -302,7 +312,7 @@ KvError BatchWriteTask::ApplyBatch(PageId &root_id,
     else
     {
         stack_.emplace_back(std::make_unique<IndexStackEntry>(
-            MemIndexPage::Handle(), Options()));
+            MemCachedPage::Handle(), Options()));
     }
 
     KvError err;
@@ -336,7 +346,7 @@ KvError BatchWriteTask::ApplyBatch(PageId &root_id,
     CHECK_KV_ERR(err);
 
     assert(!stack_.empty());
-    MemIndexPage::Handle new_root;
+    MemCachedPage::Handle new_root;
     while (!stack_.empty())
     {
         auto [new_handle, err] = Pop();
@@ -363,7 +373,7 @@ KvError BatchWriteTask::LoadApplyingPage(PageId page_id)
     }
     else
     {
-        auto [page, err] = LoadDataPage(page_id);
+        auto [page, err] = LoadDataPageForUpdate(page_id);
         CHECK_KV_ERR(err);
         applying_page_ = std::move(page);
     }
@@ -459,7 +469,8 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
             std::string_view val,
             bool is_ptr,
             uint64_t ts,
-            uint64_t expire_ts) -> KvError
+            uint64_t expire_ts,
+            bool large_value = false) -> KvError
         {
             if (expire_ts != 0 && expire_ts <= now_ms)
             {
@@ -469,16 +480,21 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
                     err = DelOverflowValue(val);
                     CHECK_KV_ERR(err);
                 }
+                else if (large_value)
+                {
+                    DelLargeValue(val);
+                }
                 UpdateTTL(expire_ts, key, WriteOp::Delete);
                 return KvError::NoError;
             }
 
             bool success = data_page_builder_.Add(
-                key, val, is_ptr, ts, expire_ts, compression_type);
+                key, val, is_ptr, ts, expire_ts, compression_type, large_value);
             if (!success)
             {
-                if (!is_ptr && DataPageBuilder::IsOverflowKV(
-                                   key, val.size(), ts, expire_ts, Options()))
+                if (!is_ptr && !large_value &&
+                    DataPageBuilder::IsOverflowKV(
+                        key, val.size(), ts, expire_ts, Options()))
                 {
                     // The key-value pair is too large to fit in a single
                     // data page. Split it into multiple overflow pages.
@@ -495,8 +511,13 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
                     {prev_key.data(), prev_key.size()}, key);
                 assert(!prev_key.empty() && prev_key < curr_page_key);
                 data_page_builder_.Reset();
-                success = data_page_builder_.Add(
-                    key, val, is_ptr, ts, expire_ts, compression_type);
+                success = data_page_builder_.Add(key,
+                                                 val,
+                                                 is_ptr,
+                                                 ts,
+                                                 expire_ts,
+                                                 compression_type,
+                                                 large_value);
                 assert(success);
                 page_id = MaxPageId;
             }
@@ -511,6 +532,7 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
         std::string_view base_val = base_page_iter.Value();
         uint64_t base_ts = base_page_iter.Timestamp();
         bool is_overflow_ptr = false;
+        bool is_large_value = false;
 
         change_key = {change_it->key_.data(), change_it->key_.size()};
         std::string_view change_val = {change_it->val_.data(),
@@ -538,6 +560,7 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
             new_val = base_val;
             new_ts = base_ts;
             is_overflow_ptr = base_page_iter.IsOverflow();
+            is_large_value = base_page_iter.IsLargeValue();
             expire_ts = base_page_iter.ExpireTs();
             adv_type = AdvanceType::PageIter;
         }
@@ -550,6 +573,10 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
                 {
                     err = DelOverflowValue(base_val);
                     CHECK_KV_ERR(err);
+                }
+                else if (base_page_iter.IsLargeValue())
+                {
+                    DelLargeValue(base_val);
                 }
                 const uint64_t base_expire = base_page_iter.ExpireTs();
                 expire_ts = change_it->expire_ts_;
@@ -588,6 +615,7 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
                 new_val = base_val;
                 new_ts = base_ts;
                 is_overflow_ptr = base_page_iter.IsOverflow();
+                is_large_value = base_page_iter.IsLargeValue();
                 expire_ts = base_page_iter.ExpireTs();
             }
         }
@@ -616,7 +644,15 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
         {
             if (add_change_key)
             {
-                if (Options()->enable_compression)
+                if (change_it->HasLargeValue())
+                {
+                    err = WriteLargeValue(*change_it);
+                    CHECK_KV_ERR(err);
+                    new_val = large_value_content_;
+                    is_large_value = true;
+                    compression_type = compression::CompressionType::None;
+                }
+                else if (Options()->enable_compression)
                 {
                     compression::PreparedValue prepared = compression::Prepare(
                         new_val, compression, compression_scratch);
@@ -632,8 +668,12 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
             {
                 compression_type = base_page_iter.CompressionType();
             }
-            err = add_to_page(
-                new_key, new_val, is_overflow_ptr, new_ts, expire_ts);
+            err = add_to_page(new_key,
+                              new_val,
+                              is_overflow_ptr,
+                              new_ts,
+                              expire_ts,
+                              is_large_value);
             CHECK_KV_ERR(err);
         }
 
@@ -658,10 +698,11 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
         std::string_view key = base_page_iter.Key();
         std::string_view val = base_page_iter.Value();
         bool overflow = base_page_iter.IsOverflow();
+        bool large_val = base_page_iter.IsLargeValue();
         uint64_t ts = base_page_iter.Timestamp();
         uint64_t expire_ts = base_page_iter.ExpireTs();
         compression_type = base_page_iter.CompressionType();
-        err = add_to_page(key, val, overflow, ts, expire_ts);
+        err = add_to_page(key, val, overflow, ts, expire_ts, large_val);
         CHECK_KV_ERR(err);
         AdvanceDataPageIter(base_page_iter, is_base_iter_valid);
     }
@@ -678,9 +719,18 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
                                  change_it->val_.size()};
             uint64_t ts = change_it->timestamp_;
             uint64_t expire_ts = change_it->expire_ts_;
+            bool large_val = false;
             UpdateTTL(expire_ts, key, WriteOp::Upsert);
 
-            if (Options()->enable_compression)
+            if (change_it->HasLargeValue())
+            {
+                err = WriteLargeValue(*change_it);
+                CHECK_KV_ERR(err);
+                val = large_value_content_;
+                large_val = true;
+                compression_type = compression::CompressionType::None;
+            }
+            else if (Options()->enable_compression)
             {
                 compression::PreparedValue prepared =
                     compression::Prepare(val, compression, compression_scratch);
@@ -691,7 +741,7 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
             {
                 compression_type = compression::CompressionType::None;
             }
-            err = add_to_page(key, val, false, ts, expire_ts);
+            err = add_to_page(key, val, false, ts, expire_ts, large_val);
             CHECK_KV_ERR(err);
         }
         else
@@ -726,18 +776,18 @@ KvError BatchWriteTask::ApplyOnePage(size_t &cidx, uint64_t now_ms)
     return KvError::NoError;
 }
 
-std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
+std::pair<MemCachedPage::Handle, KvError> BatchWriteTask::Pop()
 {
     if (stack_.empty())
     {
-        return {MemIndexPage::Handle(), KvError::NoError};
+        return {MemCachedPage::Handle(), KvError::NoError};
     }
 
     IndexStackEntry *stack_entry = stack_.back().get();
     // There is no change at this level.
     if (stack_entry->changes_.empty())
     {
-        MemIndexPage::Handle handle = std::move(stack_entry->handle_);
+        MemCachedPage::Handle handle = std::move(stack_entry->handle_);
         stack_.pop_back();
         return {std::move(handle), KvError::NoError};
     }
@@ -762,7 +812,7 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
     // We keep the previous built page in the pipeline before flushing it to
     // storage. This is to redistribute between last two pages in case the last
     // page is sparse.
-    MemIndexPage::Handle prev_handle;
+    MemCachedPage::Handle prev_handle;
     std::string prev_key;
     PageId prev_page_id = MaxPageId;
     std::string_view page_key =
@@ -847,7 +897,7 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
             KvError err = add_to_page(new_key, new_page_id);
             if (err != KvError::NoError)
             {
-                return {MemIndexPage::Handle(), err};
+                return {MemCachedPage::Handle(), err};
             }
         }
 
@@ -873,7 +923,7 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
         KvError err = add_to_page(new_key, new_page_id);
         if (err != KvError::NoError)
         {
-            return {MemIndexPage::Handle(), err};
+            return {MemCachedPage::Handle(), err};
         }
         AdvanceIndexPageIter(base_page_iter, is_base_iter_valid);
     }
@@ -887,13 +937,13 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
             KvError err = add_to_page(new_key, new_page);
             if (err != KvError::NoError)
             {
-                return {MemIndexPage::Handle(), err};
+                return {MemCachedPage::Handle(), err};
             }
         }
         ++cit;
     }
 
-    MemIndexPage::Handle new_root;
+    MemCachedPage::Handle new_root;
     if (idx_page_builder_.IsEmpty())
     {
         FreePage(stack_.back()->handle_->GetPageId());
@@ -912,13 +962,13 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
             prev_handle, prev_key, prev_page_id, std::move(curr_page_key));
         if (err != KvError::NoError)
         {
-            return {MemIndexPage::Handle(), err};
+            return {MemCachedPage::Handle(), err};
         }
         err = FlushIndexPage(
             prev_handle, std::move(prev_key), prev_page_id, splited);
         if (err != KvError::NoError)
         {
-            return {MemIndexPage::Handle(), err};
+            return {MemCachedPage::Handle(), err};
         }
         if (!splited)
         {
@@ -930,7 +980,7 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::Pop()
     return {std::move(new_root), KvError::NoError};
 }
 
-KvError BatchWriteTask::FinishIndexPage(MemIndexPage::Handle &prev_handle,
+KvError BatchWriteTask::FinishIndexPage(MemCachedPage::Handle &prev_handle,
                                         std::string &prev_key,
                                         PageId &prev_page_id,
                                         std::string cur_page_key)
@@ -955,21 +1005,21 @@ KvError BatchWriteTask::FinishIndexPage(MemIndexPage::Handle &prev_handle,
         KvError err = FlushIndexPage(
             prev_handle, std::move(prev_key), prev_page_id, true);
         CHECK_KV_ERR(err);
-        prev_handle = MemIndexPage::Handle();
+        prev_handle = MemCachedPage::Handle();
         prev_page_id = MaxPageId;
     }
-    MemIndexPage *cur_page = shard->IndexManager()->AllocIndexPage();
+    MemCachedPage *cur_page = shard->IndexManager()->AllocPage();
     if (cur_page == nullptr)
     {
         return KvError::OutOfMem;
     }
     memcpy(cur_page->PagePtr(), page_view.data(), page_view.size());
-    prev_handle = MemIndexPage::Handle(cur_page);
+    prev_handle = MemCachedPage::Handle(cur_page);
     prev_key = std::move(cur_page_key);
     return KvError::NoError;
 }
 
-KvError BatchWriteTask::FlushIndexPage(MemIndexPage::Handle &idx_page,
+KvError BatchWriteTask::FlushIndexPage(MemCachedPage::Handle &idx_page,
                                        std::string idx_page_key,
                                        PageId page_id,
                                        bool split)
@@ -988,7 +1038,7 @@ KvError BatchWriteTask::FlushIndexPage(MemIndexPage::Handle &idx_page,
         {
             stack_.emplace(stack_.begin(),
                            std::make_unique<IndexStackEntry>(
-                               MemIndexPage::Handle(), Options()));
+                               MemCachedPage::Handle(), Options()));
         }
 
         IndexStackEntry *parent_entry = stack_[stack_.size() - 2].get();
@@ -1123,9 +1173,10 @@ Page BatchWriteTask::Redistribute(DataPage &prev_page,
     return new_page;
 }
 
-std::string_view BatchWriteTask::Redistribute(MemIndexPage::Handle &prev_handle,
-                                              std::string_view cur_page,
-                                              std::string &cur_page_key)
+std::string_view BatchWriteTask::Redistribute(
+    MemCachedPage::Handle &prev_handle,
+    std::string_view cur_page,
+    std::string &cur_page_key)
 {
     const uint16_t prev_page_len = prev_handle->ContentLength();
     const uint16_t cur_page_len =
@@ -1286,6 +1337,10 @@ KvError BatchWriteTask::DeleteDataPage(PageId page_id, bool update_prev)
             err = DelOverflowValue(iter.Value());
             CHECK_KV_ERR(err);
         }
+        else if (iter.IsLargeValue())
+        {
+            DelLargeValue(iter.Value());
+        }
         uint64_t expire_ts = iter.ExpireTs();
         UpdateTTL(expire_ts, iter.Key(), WriteOp::Delete);
     }
@@ -1297,7 +1352,7 @@ KvError BatchWriteTask::DeleteDataPage(PageId page_id, bool update_prev)
     }
     // This is the first truncated data page, and the previous data page will
     // become the new tail data page.
-    auto [prev_page, err_prev] = LoadDataPage(page.PrevPageId());
+    auto [prev_page, err_prev] = LoadDataPageForUpdate(page.PrevPageId());
     if (err_prev != KvError::NoError)
     {
         return err_prev;
@@ -1400,6 +1455,217 @@ KvError BatchWriteTask::DelOverflowValue(std::string_view encoded_ptrs)
     return KvError::NoError;
 }
 
+void BatchWriteTask::EnsureSegmentMapper()
+{
+    if (cow_meta_.segment_mapper_ != nullptr)
+    {
+        return;
+    }
+    PageManager *idx_mgr = shard->IndexManager();
+    const TableIdent *tbl_id = &cow_meta_.root_handle_.EntryPtr()->tbl_id_;
+    auto mapper = std::make_unique<PageMapper>(idx_mgr, tbl_id);
+    // Replace the default data-file allocator with a segment-file allocator.
+    mapper->file_page_allocator_ = std::make_unique<AppendAllocator>(
+        Options()->segments_per_file_shift, 0, 0, 0);
+    cow_meta_.segment_mapper_ = std::move(mapper);
+    // Register the new mapping snapshot with RootMeta for reference tracking.
+    RootMeta *meta = cow_meta_.root_handle_.Get();
+    meta->segment_mapping_snapshots_.insert(
+        cow_meta_.segment_mapper_->GetMapping());
+}
+
+KvError BatchWriteTask::WriteLargeValue(const WriteDataEntry &entry)
+{
+    // Metadata travels in `val_` when the entry also carries a large value.
+    std::string_view metadata{entry.val_};
+
+    if (const IoStringBuffer *iosb =
+            std::get_if<IoStringBuffer>(&entry.large_val_);
+        iosb != nullptr)
+    {
+        const auto &fragments = iosb->Fragments();
+        const uint32_t num_segments = fragments.size();
+        std::vector<const char *> ptrs(num_segments);
+        std::vector<uint16_t> buf_indices(num_segments);
+        for (uint32_t i = 0; i < num_segments; ++i)
+        {
+            ptrs[i] = fragments[i].data_;
+            buf_indices[i] = fragments[i].buf_index_;
+        }
+        return WriteLargeValueSegments(
+            static_cast<uint32_t>(iosb->Size()), ptrs, buf_indices, metadata);
+    }
+
+    if (const auto *pinned =
+            std::get_if<std::pair<const char *, size_t>>(&entry.large_val_);
+        pinned != nullptr)
+    {
+        const uint32_t seg_size = Options()->segment_size;
+        const char *base = pinned->first;
+        const size_t size = pinned->second;
+        assert(base != nullptr);
+        assert(size > 0);
+        const uint32_t num_segments =
+            static_cast<uint32_t>((size + seg_size - 1) / seg_size);
+
+        // Writes always flush K = ceil(size / seg_size) full segments to
+        // disk -- segment files are allocated at seg_size granularity, and
+        // io_uring_prep_write_fixed in WriteSegments reads exactly seg_size
+        // bytes per request. The garbage past `size` that ends up on disk is
+        // skipped on read via the header's `actual_length` (small payloads)
+        // or Phase 6's `tail_size` (contiguous-pinned reads), so it is
+        // never surfaced to consumers.
+        //
+        // The caller's contract is "[base, base + size) is within one
+        // registered pinned chunk". When `size` doesn't divide seg_size, the
+        // final segment's read range extends to base + K*seg_size, which may
+        // fall outside the registered chunk. Two paths:
+        //   - Fast path (the common case): if the chunk has slack and
+        //     [base, base + K*seg_size) is fully inside it, write all K
+        //     segments directly from the caller's pinned memory.
+        //   - Fallback: the trailing region crosses the chunk boundary.
+        //     Acquire one segment-sized scratch slot from the tail-scratch
+        //     pool, copy the meaningful tail into it, zero-pad, and write
+        //     the final segment from the scratch slot instead. The first
+        //     K-1 segments still write from the caller's memory because
+        //     `(K-1) * seg_size < size` by the definition of K.
+        // Locate the registered pinned chunk that contains `base`. One
+        // linear scan yields the chunk's bounds and its buf_index; the
+        // contract checks below are then plain pointer arithmetic.
+        AsyncIoManager *io_mgr = IoMgr();
+        auto chunk = io_mgr->PinnedChunkFor(base);
+        if (!chunk)
+        {
+            return KvError::InvalidArgs;
+        }
+        const uint16_t base_buf_index = chunk->buf_index;
+        const char *chunk_end = chunk->base + chunk->size;
+        // The meaningful range must fit in one chunk.
+        if (base + size > chunk_end)
+        {
+            return KvError::InvalidArgs;
+        }
+        // Fast path when the rounded-up K * seg_size range also fits in the
+        // chunk; otherwise the final segment crosses the chunk boundary and
+        // we need a scratch slot.
+        const bool needs_scratch =
+            (base + static_cast<size_t>(num_segments) * seg_size > chunk_end);
+
+        std::vector<const char *> ptrs(num_segments);
+        std::vector<uint16_t> buf_indices(num_segments, base_buf_index);
+        for (uint32_t i = 0; i < num_segments; ++i)
+        {
+            ptrs[i] = base + static_cast<size_t>(i) * seg_size;
+        }
+
+        char *scratch_ptr = nullptr;
+        uint16_t scratch_buf_index = 0;
+        if (needs_scratch)
+        {
+            scratch_ptr = io_mgr->AcquireTailScratch(scratch_buf_index);
+            if (scratch_ptr == nullptr)
+            {
+                // Pool not allocated (pinned_tail_scratch_slots == 0); the
+                // caller's pinned range doesn't extend to K*seg_size, so we
+                // can't safely issue the last fixed write.
+                return KvError::InvalidArgs;
+            }
+            const size_t tail_meaningful =
+                size - static_cast<size_t>(num_segments - 1) * seg_size;
+            assert(tail_meaningful > 0 && tail_meaningful <= seg_size);
+            std::memcpy(scratch_ptr,
+                        base + static_cast<size_t>(num_segments - 1) * seg_size,
+                        tail_meaningful);
+            std::memset(
+                scratch_ptr + tail_meaningful, 0, seg_size - tail_meaningful);
+            ptrs[num_segments - 1] = scratch_ptr;
+            buf_indices[num_segments - 1] = scratch_buf_index;
+        }
+
+        KvError result = WriteLargeValueSegments(
+            static_cast<uint32_t>(size), ptrs, buf_indices, metadata);
+
+        if (needs_scratch)
+        {
+            io_mgr->ReleaseTailScratch(scratch_ptr);
+        }
+        return result;
+    }
+
+    // HasLargeValue() should gate calls; monostate here is a caller bug.
+    assert(false && "WriteLargeValue called on entry without a large value");
+    return KvError::InvalidArgs;
+}
+
+KvError BatchWriteTask::WriteLargeValueSegments(
+    uint32_t actual_length,
+    std::span<const char *> ptrs,
+    std::span<const uint16_t> buf_indices,
+    std::string_view metadata)
+{
+    assert(ptrs.size() == buf_indices.size());
+    EnsureSegmentMapper();
+
+    const uint32_t num_segments = static_cast<uint32_t>(ptrs.size());
+    large_value_content_.clear();
+
+    // Allocate logical segment IDs and physical file segment IDs.
+    std::vector<PageId> logical_ids(num_segments);
+    std::vector<FilePageId> physical_ids(num_segments);
+    for (uint32_t i = 0; i < num_segments; ++i)
+    {
+        auto [logical_id, file_page_id] = AllocateSegment(MaxPageId);
+        logical_ids[i] = logical_id;
+        physical_ids[i] = file_page_id;
+    }
+
+    // Write segments in batches of max_segments_batch.
+    for (uint32_t offset = 0; offset < num_segments;
+         offset += max_segments_batch)
+    {
+        uint32_t batch_size =
+            std::min(uint32_t(max_segments_batch), num_segments - offset);
+        std::array<FilePageId, max_segments_batch> batch_fp_ids;
+        std::array<const char *, max_segments_batch> batch_ptrs;
+        std::array<uint16_t, max_segments_batch> batch_buf_indices;
+        for (uint32_t i = 0; i < batch_size; ++i)
+        {
+            batch_fp_ids[i] = physical_ids[offset + i];
+            batch_ptrs[i] = ptrs[offset + i];
+            batch_buf_indices[i] = buf_indices[offset + i];
+        }
+        KvError err =
+            IoMgr()->WriteSegments(tbl_ident_,
+                                   {batch_fp_ids.data(), batch_size},
+                                   {batch_ptrs.data(), batch_size},
+                                   {batch_buf_indices.data(), batch_size});
+        CHECK_KV_ERR(err);
+    }
+
+    EncodeLargeValueContent(actual_length,
+                            {logical_ids.data(), num_segments},
+                            large_value_content_,
+                            metadata);
+    return KvError::NoError;
+}
+
+void BatchWriteTask::DelLargeValue(std::string_view encoded_content)
+{
+    auto header =
+        DecodeLargeValueHeader(encoded_content, Options()->segment_size);
+    assert(header.has_value());
+    std::vector<PageId> segment_ids(header->num_segments);
+    bool ok = DecodeLargeValueContent(encoded_content, *header, segment_ids);
+    assert(ok);
+    (void) ok;
+    assert(cow_meta_.segment_mapper_ != nullptr);
+    for (uint32_t i = 0; i < header->num_segments; ++i)
+    {
+        cow_meta_.segment_mapper_->FreePage(segment_ids[i]);
+        RecordSegmentMappingDelete(segment_ids[i]);
+    }
+}
+
 void BatchWriteTask::AdvanceDataPageIter(DataPageIter &iter, bool &is_valid)
 {
     is_valid = iter.HasNext() ? iter.Next() : false;
@@ -1410,14 +1676,14 @@ void BatchWriteTask::AdvanceIndexPageIter(IndexPageIter &iter, bool &is_valid)
     is_valid = iter.HasNext() ? iter.Next() : false;
 }
 
-std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::TruncateIndexPage(
+std::pair<MemCachedPage::Handle, KvError> BatchWriteTask::TruncateIndexPage(
     PageId page_id, std::string_view trunc_pos)
 {
     auto [handle, err] = shard->IndexManager()->FindPage(
         cow_meta_.mapper_->GetMapping(), page_id);
     if (err != KvError::NoError)
     {
-        return {MemIndexPage::Handle(), err};
+        return {MemCachedPage::Handle(), err};
     }
 
     const bool is_leaf_idx = handle->IsPointingToLeaf();
@@ -1485,7 +1751,7 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::TruncateIndexPage(
             err = delete_sub_node(sub_node_key, sub_node_id, false);
             if (err != KvError::NoError)
             {
-                return {MemIndexPage::Handle(), err};
+                return {MemCachedPage::Handle(), err};
             }
         }
         else if (Comp()->Compare(trunc_pos, next_node_key) >= 0)
@@ -1510,7 +1776,7 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::TruncateIndexPage(
             }
             if (err != KvError::NoError)
             {
-                return {MemIndexPage::Handle(), err};
+                return {MemCachedPage::Handle(), err};
             }
         }
 
@@ -1531,41 +1797,41 @@ std::pair<MemIndexPage::Handle, KvError> BatchWriteTask::TruncateIndexPage(
     }
     if (err != KvError::NoError)
     {
-        return {MemIndexPage::Handle(), err};
+        return {MemCachedPage::Handle(), err};
     }
 
     if (builder.IsEmpty())
     {
         // This index page is wholly deleted
         FreePage(page_id);
-        return {MemIndexPage::Handle(), KvError::NoError};
+        return {MemCachedPage::Handle(), KvError::NoError};
     }
     // This index page is partially truncated
-    MemIndexPage *new_page = shard->IndexManager()->AllocIndexPage();
+    MemCachedPage *new_page = shard->IndexManager()->AllocPage();
     if (new_page == nullptr)
     {
-        return {MemIndexPage::Handle(), KvError::OutOfMem};
+        return {MemCachedPage::Handle(), KvError::OutOfMem};
     }
-    MemIndexPage::Handle new_handle(new_page);
+    MemCachedPage::Handle new_handle(new_page);
     std::string_view page_view = builder.Finish();
     memcpy(new_handle->PagePtr(), page_view.data(), page_view.size());
     new_handle->SetPageId(page_id);
     err = WritePage(new_handle);
     if (err != KvError::NoError)
     {
-        MemIndexPage *page = new_handle.Get();
+        MemCachedPage *page = new_handle.Get();
         new_handle.Reset();
         CHECK(page->IsDetached());
         CHECK(!page->IsPinned());
-        shard->IndexManager()->FreeIndexPage(page);
-        return {MemIndexPage::Handle(), err};
+        shard->IndexManager()->FreePage(page);
+        return {MemCachedPage::Handle(), err};
     }
     return {std::move(new_handle), KvError::NoError};
 }
 
 KvError BatchWriteTask::Truncate(std::string_view trunc_pos)
 {
-    KvError err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
+    KvError err = MakeCowRoot();
     CHECK_KV_ERR(err);
     if (cow_meta_.root_id_ == MaxPageId)
     {
@@ -1611,6 +1877,48 @@ KvError BatchWriteTask::Truncate(std::string_view trunc_pos)
     return UpdateMeta();
 }
 
+KvError BatchWriteTask::Drop()
+{
+    // 1. Delete the manifest (local, and cloud copy in cloud mode).
+    KvError err = IoMgr()->DropManifest(tbl_ident_);
+    if (err != KvError::NoError)
+    {
+        LOG(ERROR) << "Drop: DropManifest failed for " << tbl_ident_.ToString()
+                   << ": " << ErrorString(err);
+        return err;
+    }
+
+    // 2. Clear the in-memory RootMeta.  The entry cannot be Erase'd here
+    //    because a concurrent read may hold a Handle (ref_cnt_ > 0) while
+    //    yielded on IO.  Instead we clear the fields; when the last reader
+    //    Unpins and ref_cnt_ reaches 0, RootMetaMgr will enqueue the entry
+    //    for deferred Erase.
+    RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
+    auto *entry = root_meta_mgr->Find(tbl_ident_);
+    if (entry != nullptr)
+    {
+        RootMeta &meta = entry->meta_;
+        meta.root_id_ = MaxPageId;
+        meta.ttl_root_id_ = MaxPageId;
+        meta.manifest_size_ = 0;
+        meta.next_expire_ts_ = 0;
+        meta.mapper_.reset();
+        meta.mapping_snapshots_.clear();
+        meta.compression_.reset();
+        root_meta_mgr->UpdateBytes(entry, 0);
+    }
+
+    // 3. Schedule async GC to clean up orphaned data files.  GC will find no
+    //    manifest, treat all data files as unreferenced, delete them, and
+    //    remove the now-empty partition directory.  GC requires append mode.
+    if (Options()->data_append_mode && !shard->HasPendingLocalGc(tbl_ident_))
+    {
+        shard->AddPendingLocalGc(tbl_ident_);
+    }
+
+    return KvError::NoError;
+}
+
 std::pair<bool, KvError> BatchWriteTask::TruncateDataPage(
     PageId page_id, std::string_view trunc_pos)
 {
@@ -1636,7 +1944,8 @@ std::pair<bool, KvError> BatchWriteTask::TruncateDataPage(
                                iter.IsOverflow(),
                                iter.Timestamp(),
                                iter.ExpireTs(),
-                               iter.CompressionType());
+                               iter.CompressionType(),
+                               iter.IsLargeValue());
     }
     if (has_trunc_tail)
     {
@@ -1649,6 +1958,10 @@ std::pair<bool, KvError> BatchWriteTask::TruncateDataPage(
                 {
                     return {true, err};
                 }
+            }
+            else if (iter.IsLargeValue())
+            {
+                DelLargeValue(iter.Value());
             }
             uint64_t expire_ts = iter.ExpireTs();
             UpdateTTL(expire_ts, iter.Key(), WriteOp::Delete);
@@ -1666,7 +1979,7 @@ std::pair<bool, KvError> BatchWriteTask::TruncateDataPage(
         }
         // The previous data page will become the new tail data page.
         // We don't need to update the previous page id of the next data page.
-        auto [prev_page, err] = LoadDataPage(prev_page_id);
+        auto [prev_page, err] = LoadDataPageForUpdate(prev_page_id);
         if (err != KvError::NoError)
         {
             return {false, err};
@@ -1735,7 +2048,7 @@ KvError BatchWriteTask::CleanExpiredKeys()
         return KvError::NoError;
     }
 
-    err = shard->IndexManager()->MakeCowRoot(tbl_ident_, cow_meta_);
+    err = MakeCowRoot();
     CHECK_KV_ERR(err);
     assert(cow_meta_.next_expire_ts_ != 0 &&
            cow_meta_.next_expire_ts_ <= now_ts_ms);

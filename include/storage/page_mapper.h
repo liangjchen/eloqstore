@@ -9,14 +9,14 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "pool.h"
-#include "storage/mem_index_page.h"
+#include "storage/mem_cached_page.h"
 #include "tasks/task.h"
 #include "types.h"
 
 namespace eloqstore
 {
-class IndexPageManager;
-class MemIndexPage;
+class PageManager;
+class MemCachedPage;
 class ManifestBuilder;
 class ManifestBuffer;
 struct KvOptions;
@@ -109,7 +109,7 @@ struct MappingSnapshot
         MappingChunkArena *chunk_arena_{nullptr};
     };
 
-    MappingSnapshot(IndexPageManager *idx_mgr,
+    MappingSnapshot(PageManager *idx_mgr,
                     const TableIdent *tbl_id,
                     MappingTbl tbl);
     ~MappingSnapshot();
@@ -138,9 +138,9 @@ struct MappingSnapshot
      *
      * @param page
      */
-    void Unswizzling(MemIndexPage *page);
-    MemIndexPage::Handle GetSwizzlingHandle(PageId page_id) const;
-    void AddSwizzling(PageId page_id, MemIndexPage *idx_page);
+    void Unswizzling(MemCachedPage *page);
+    MemCachedPage::Handle GetSwizzlingHandle(PageId page_id) const;
+    void AddSwizzling(PageId page_id, MemCachedPage *idx_page);
 
     static bool IsSwizzlingPointer(uint64_t val);
     static bool IsFilePageId(uint64_t val);
@@ -154,7 +154,7 @@ struct MappingSnapshot
     // Destructors often run on non-shard threads (e.g. Stop() callers) where
     // TLS `shard` is invalid, so we rely on idx_mgr_ to reclaim resources. It
     // remains valid until RootMetaMgr::ReleaseMappers() clears snapshots.
-    IndexPageManager *idx_mgr_;
+    PageManager *idx_mgr_;
     const TableIdent *tbl_ident_;
 
     /**
@@ -254,6 +254,10 @@ public:
     static std::unique_ptr<FilePageAllocator> Instance(const KvOptions *opts);
 
     FilePageAllocator(const KvOptions *opts, FilePageId max_id = 0);
+    FilePageAllocator(uint8_t shift, FilePageId max_id)
+        : pages_per_file_shift_(shift), max_fp_id_(max_id)
+    {
+    }
     FilePageAllocator(const FilePageAllocator &rhs) = default;
     virtual ~FilePageAllocator() = default;
     virtual FilePageId Allocate();
@@ -288,6 +292,13 @@ public:
                     FilePageId max_fp_id,
                     uint32_t empty_cnt)
         : FilePageAllocator(opts, max_fp_id),
+          min_file_id_(min_file_id),
+          empty_file_cnt_(empty_cnt) {};
+    AppendAllocator(uint8_t shift,
+                    FileId min_file_id,
+                    FilePageId max_fp_id,
+                    uint32_t empty_cnt)
+        : FilePageAllocator(shift, max_fp_id),
           min_file_id_(min_file_id),
           empty_file_cnt_(empty_cnt) {};
     AppendAllocator(const AppendAllocator &rhs) = default;
@@ -348,7 +359,7 @@ class PageMapper
 public:
     explicit PageMapper(MappingSnapshot::Ref mapping)
         : mapping_(std::move(mapping)) {};
-    PageMapper(IndexPageManager *idx_mgr, const TableIdent *tbl_ident);
+    PageMapper(PageManager *idx_mgr, const TableIdent *tbl_ident);
     PageMapper(const PageMapper &rhs);
 
     PageId GetPage();
@@ -378,6 +389,7 @@ private:
     std::unique_ptr<FilePageAllocator> file_page_allocator_{nullptr};
 
     friend class Replayer;
+    friend class BatchWriteTask;
 };
 
 }  // namespace eloqstore

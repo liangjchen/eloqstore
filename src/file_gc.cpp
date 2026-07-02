@@ -16,13 +16,14 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/strings/string_view.h"
 #include "async_io_manager.h"
 #include "common.h"
 #include "eloq_store.h"
 #include "error.h"
 #include "kv_options.h"
 #include "replayer.h"
-#include "storage/mem_index_page.h"
+#include "storage/mem_cached_page.h"
 #include "storage/object_store.h"
 #include "storage/shard.h"
 #include "tasks/task.h"
@@ -32,8 +33,13 @@ namespace eloqstore
 void GetRetainedFiles(absl::flat_hash_set<RetainedFileKey> &result,
                       const MappingSnapshot::MappingTbl &tbl,
                       const BranchFileMapping &file_ranges,
-                      uint8_t pages_per_file_shift)
+                      uint8_t per_file_shift,
+                      bool is_segment)
 {
+    auto encode = [is_segment](FileId id) -> TypedFileId
+    { return is_segment ? SegmentFileKey(id) : DataFileKey(id); };
+    const char *kind = is_segment ? "segment" : "data";
+
     const size_t tbl_size = tbl.size();
     for (PageId page_id = 0; page_id < tbl_size; ++page_id)
     {
@@ -41,42 +47,41 @@ void GetRetainedFiles(absl::flat_hash_set<RetainedFileKey> &result,
         if (MappingSnapshot::IsFilePageId(val))
         {
             FilePageId fp_id = MappingSnapshot::DecodeId(val);
-            FileId file_id = fp_id >> pages_per_file_shift;
+            FileId file_id = fp_id >> per_file_shift;
 
-            // Look up the branch and term for this file_id
             std::string branch_name;
             uint64_t term = 0;
-            if (GetBranchNameAndTerm(file_ranges, file_id, branch_name, term))
+            if (GetBranchNameAndTerm(
+                    file_ranges, encode(file_id), branch_name, term))
             {
                 result.emplace(
                     RetainedFileKey{file_id, std::move(branch_name), term});
             }
             else
             {
-                // File ID not in any known branch range; skip it
-                DLOG(WARNING) << "GetRetainedFiles: file_id " << file_id
-                              << " not found in any branch range";
+                DLOG(WARNING) << "GetRetainedFiles: " << kind << " file_id "
+                              << file_id << " not found in any branch range";
             }
         }
         else if (MappingSnapshot::IsSwizzlingPointer(val))
         {
-            MemIndexPage *idx_page = reinterpret_cast<MemIndexPage *>(val);
+            // Swizzling pointers only appear in data mapping tables.
+            MemCachedPage *idx_page = reinterpret_cast<MemCachedPage *>(val);
             FilePageId fp_id = idx_page->GetFilePageId();
-            FileId file_id = fp_id >> pages_per_file_shift;
+            FileId file_id = fp_id >> per_file_shift;
 
-            // Look up the branch and term for this file_id
             std::string branch_name;
             uint64_t term = 0;
-            if (GetBranchNameAndTerm(file_ranges, file_id, branch_name, term))
+            if (GetBranchNameAndTerm(
+                    file_ranges, encode(file_id), branch_name, term))
             {
                 result.emplace(
                     RetainedFileKey{file_id, std::move(branch_name), term});
             }
             else
             {
-                // File ID not in any known branch range; skip it
                 DLOG(WARNING)
-                    << "GetRetainedFiles: file_id " << file_id
+                    << "GetRetainedFiles: " << kind << " file_id " << file_id
                     << " not found in any branch range (swizzling pointer)";
             }
         }
@@ -92,6 +97,73 @@ namespace FileGarbageCollector
 
 namespace
 {
+// Amortized cooperative-yield poll rate for the cheap per-file scan loops
+// (ClassifyFiles / DeleteUnreferenced*): their body is a single filename parse,
+// so calling MaybeYield() -- which reads the clock -- every iteration would be
+// a large fraction of the loop. Poll the budget once per this many iterations
+// instead; the time-based yield still bounds the stall (a few hundred parses is
+// tens of us, vs the tens-of-ms segments this targets). Loops doing a syscall /
+// IO per iteration (ListLocalFiles, manifest replay) keep calling MaybeYield()
+// every iteration -- there the clock read is already negligible.
+constexpr uint64_t kYieldPollStride = 256;
+
+// Seed the active branch's in-flight write guard from the in-memory RootMeta
+// (no disk read). For a live partition the boundary is the data/segment
+// allocator's current MaxFilePageId() in file-id space; a stub RootMeta (no
+// mapper) seeds no guard at all (see the body). The on-disk manifest pass that
+// runs after this composes via std::max, so a non-active branch whose disk
+// manifest reaches further still wins. retained_files is left entirely to the
+// disk-manifest pass; the in-flight guard alone covers everything past the
+// boundary.
+void SeedActiveBranchGuardFromInMemory(const TableIdent &tbl_id,
+                                       std::string_view active_branch,
+                                       uint64_t process_term,
+                                       uint8_t pages_per_file_shift,
+                                       uint8_t segments_per_file_shift,
+                                       BranchGuardMap &branch_guards)
+{
+    assert(shard != nullptr);
+    RootMetaMgr *root_meta_mgr = shard->IndexManager()->RootMetaManager();
+    RootMetaMgr::Entry *entry = root_meta_mgr->Find(tbl_id);
+    if (entry == nullptr)
+        return;
+    BranchGuard guard{process_term, 0, 0};
+    // No yields between Find() and the field reads below, so the
+    // entry cannot be evicted out from under us; no Handle pin needed.
+    const RootMeta &meta = entry->meta_;
+    // A stub RootMeta (no data mapper) is a placeholder with no live mapping
+    // and no in-flight writes -- e.g. a partition mid-reopen/drop on a standby.
+    // Seed NO guard for it: its allocators are zero-valued, so a guard would be
+    // least_unflushed=0 and mark every local file "in-flight", protecting
+    // orphaned files from reclamation forever. With no active-branch guard,
+    // DeleteUnreferenced* treats the branch as having a dropped manifest and
+    // reclaims the unretained files (see the missing-guard handling there). A
+    // valid on-disk manifest, if any, still seeds the guard via
+    // ProcessOneManifest.
+    if (meta.mapper_ == nullptr)
+    {
+        return;
+    }
+    // Derive the in-flight boundary from the live allocators rather than the
+    // RootMeta::first_unflushed_*_fp_id_ snapshot fields. Those fields are only
+    // refreshed by a flush whose CoW meta carries the matching mapper, so a
+    // data-only flush leaves first_unflushed_seg_fp_id_ stale (0) even while
+    // segment files exist -- which makes the seeded guard 0 and keeps every
+    // segment file "in-flight", so GC never reclaims dead segments. The live
+    // mapper's allocator MaxFilePageId() is the current high-water and matches
+    // the disk manifest's max_*_file_id_ that ProcessOneManifest would fold in.
+    guard.least_unflushed_file_id_ =
+        meta.mapper_->FilePgAllocator()->MaxFilePageId() >>
+        pages_per_file_shift;
+    guard.least_unflushed_seg_file_id_ =
+        meta.segment_mapper_
+            ? (meta.segment_mapper_->FilePgAllocator()->MaxFilePageId() >>
+               segments_per_file_shift)
+            : 0;
+
+    branch_guards.emplace(std::string(active_branch), guard);
+}
+
 bool ParseCloudCleanupFilename(std::string_view filename,
                                FileId &file_id,
                                uint64_t &term)
@@ -111,7 +183,7 @@ bool ParseCloudCleanupFilename(std::string_view filename,
         {
             return false;
         }
-        file_id = IouringMgr::LruFD::kManifest;
+        file_id = IouringMgr::LruFD::kManifest.value_;
         return true;
     }
     return false;
@@ -134,7 +206,12 @@ void CollectLocalCleanupTargets(
             continue;
         }
 
-        IouringMgr::LruFD::Ref fd_ref = cloud_mgr->GetOpenedFD(tbl_id, file_id);
+        const TypedFileId typed_id =
+            file_id == IouringMgr::LruFD::kManifest.value_
+                ? IouringMgr::LruFD::kManifest
+                : DataFileKey(file_id);
+        IouringMgr::LruFD::Ref fd_ref =
+            cloud_mgr->GetOpenedFD(tbl_id, typed_id);
         if (fd_ref != nullptr && fd_ref.Get()->term_ == term)
         {
             if (fd_ref.Get()->ref_count_ > 1)
@@ -161,11 +238,14 @@ void CollectLocalCleanupTargets(
 
 KvError ExecuteLocalGC(const TableIdent &tbl_id,
                        RetainedFiles &retained_files,
+                       RetainedFiles &retained_segment_files,
                        IouringMgr *io_mgr)
 {
     DLOG(INFO) << "ExecuteLocalGC: starting for table " << tbl_id.tbl_name_
                << ", partition " << tbl_id.partition_id_
-               << ", retained_files count=" << retained_files.size();
+               << ", retained_files count=" << retained_files.size()
+               << ", retained_segment_files count="
+               << retained_segment_files.size();
 
     // 1. list all files in local directory.
     std::vector<std::string> local_files;
@@ -184,19 +264,32 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
     std::vector<std::string> data_files;
     std::vector<uint64_t> manifest_terms;
     std::vector<std::string> manifest_branch_names;
+    std::vector<std::string> segment_files;
     ClassifyFiles(local_files,
                   archive_files,
                   archive_tags,
                   archive_branch_names,
                   data_files,
                   manifest_terms,
-                  manifest_branch_names);
+                  manifest_branch_names,
+                  &segment_files);
 
     // No need to check term expired for local mode.
 
-    // 2a. augment retained_files from all branch manifests (regular + archive)
-    // on disk; also build max_file_id_per_branch_term map.
-    absl::flat_hash_map<std::string, FileId> max_file_id_per_branch_term;
+    // 2a. augment retained_files / retained_segment_files from all branch
+    // manifests (regular + archive) on disk and build branch_guards. For
+    // the local active branch the in-memory RootMeta tracks the boundary
+    // of the flushed region (RootMeta::first_unflushed_*_fp_id_) more
+    // currently than any disk manifest does, so we seed the active branch
+    // guard from there. The disk-manifest pass then composes via std::max
+    // so non-active branches that only live on disk are covered.
+    BranchGuardMap branch_guards;
+    SeedActiveBranchGuardFromInMemory(tbl_id,
+                                      io_mgr->GetActiveBranch(),
+                                      io_mgr->ProcessTerm(),
+                                      io_mgr->options_->pages_per_file_shift,
+                                      io_mgr->options_->segments_per_file_shift,
+                                      branch_guards);
     err = AugmentRetainedFilesFromBranchManifests(
         tbl_id,
         manifest_branch_names,
@@ -204,8 +297,10 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
         archive_files,
         archive_branch_names,
         retained_files,
-        max_file_id_per_branch_term,
+        retained_segment_files,
+        branch_guards,
         io_mgr->options_->pages_per_file_shift,
+        io_mgr->options_->segments_per_file_shift,
         io_mgr);
     if (err != KvError::NoError)
     {
@@ -216,11 +311,8 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
     }
 
     // 3. delete unreferenced data files.
-    err = DeleteUnreferencedLocalFiles(tbl_id,
-                                       data_files,
-                                       retained_files,
-                                       max_file_id_per_branch_term,
-                                       io_mgr);
+    err = DeleteUnreferencedLocalFiles(
+        tbl_id, data_files, retained_files, branch_guards, io_mgr);
     if (err != KvError::NoError)
     {
         LOG(ERROR)
@@ -229,9 +321,23 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
         return err;
     }
 
-    // If the partition is now empty except for the current manifest, clean the
-    // manifest as well so the local directory can be removed without waiting
-    // for later root-meta eviction.
+    // 4. delete unreferenced segment files. retained_segment_files was
+    // augmented in step 2a from both regular and archive manifests, so any
+    // archive-referenced segment is already protected by inclusion in that
+    // set. branch_guards drives the per-branch in-flight write guard.
+    err = DeleteUnreferencedLocalSegmentFiles(
+        tbl_id, segment_files, retained_segment_files, branch_guards, io_mgr);
+    if (err != KvError::NoError)
+    {
+        LOG(ERROR) << "ExecuteLocalGC: DeleteUnreferencedLocalSegmentFiles "
+                      "failed, error="
+                   << static_cast<int>(err);
+        return err;
+    }
+
+    // 5. If the partition is now empty except for the current manifest, clean
+    // the manifest as well so the local directory can be removed without
+    // waiting for later root-meta eviction.
     local_files.clear();
     err = ListLocalFiles(tbl_id, local_files, io_mgr);
     if (err != KvError::NoError)
@@ -257,66 +363,13 @@ KvError ExecuteLocalGC(const TableIdent &tbl_id,
 
     if (data_files.empty() && archive_files.empty())
     {
-        const StoreMode mode = eloq_store->Mode();
-        if (mode == StoreMode::Cloud)
+        err = io_mgr->TryCleanupLocalPartitionDir(tbl_id);
+        if (err != KvError::NoError)
         {
-            auto *cloud_mgr = static_cast<CloudStoreMgr *>(io_mgr);
-            err = cloud_mgr->CleanupLocalPartitionFiles(tbl_id);
-            if (err != KvError::NoError)
-            {
-                LOG(ERROR)
-                    << "ExecuteLocalGC: CleanupLocalPartitionFiles failed, "
-                    << "error=" << static_cast<int>(err);
-                return err;
-            }
-        }
-        else
-        {
-            err = io_mgr->CleanManifest(tbl_id);
-            if (err != KvError::NoError)
-            {
-                LOG(ERROR) << "ExecuteLocalGC: CleanManifest failed, error="
-                           << static_cast<int>(err);
-                return err;
-            }
-
-            CHECK(shard != nullptr);
-            RootMetaMgr *root_meta_mgr =
-                shard->IndexManager()->RootMetaManager();
-            auto *entry = root_meta_mgr->Find(tbl_id);
-            if (entry != nullptr)
-            {
-                RootMeta &meta = entry->meta_;
-                if (meta.mapper_ != nullptr && meta.manifest_size_ != 0 &&
-                    meta.root_id_ == MaxPageId &&
-                    meta.ttl_root_id_ == MaxPageId &&
-                    meta.mapper_->MappingCount() == 0)
-                {
-                    meta.manifest_size_ = 0;
-                }
-            }
+            LOG(WARNING) << "ExecuteLocalGC: TryCleanupLocalPartitionDir "
+                         << "failed, error=" << static_cast<int>(err);
         }
     }
-
-    /*
-    // 4. delete old archives beyond num_retained_archives per branch.
-    // NOTE: this step is intentionally AFTER DeleteUnreferencedLocalFiles so
-    // that ALL archives (including those about to be pruned) contribute their
-    // file IDs to retained_files first.  Files exclusively referenced by pruned
-    // archives become deletable only on the next GC cycle.
-    err = DeleteOldArchives(tbl_id,
-                            archive_files,
-                            archive_tags,
-                            archive_branch_names,
-                            io_mgr->options_->num_retained_archives,
-                            io_mgr);
-    if (err != KvError::NoError)
-    {
-        LOG(ERROR) << "ExecuteLocalGC: DeleteOldArchives failed, error="
-                   << static_cast<int>(err);
-        return err;
-    }
-    */
 
     return KvError::NoError;
 }
@@ -330,9 +383,26 @@ KvError ListLocalFiles(const TableIdent &tbl_id,
     fs::path dir_path = tbl_id.StorePath(io_mgr->options_->store_path,
                                          io_mgr->options_->store_path_lut);
 
-    for (auto &ent : fs::directory_iterator{dir_path})
+    // The partition directory may be removed concurrently (e.g. partition
+    // cleanup after a drop). Treat that as "nothing to list" rather than
+    // letting the throwing iterator abort the process.
+    std::error_code ec;
+    fs::directory_iterator it{dir_path, ec};
+    if (ec)
     {
-        const std::string name = ent.path().filename();
+        return KvError::NoError;
+    }
+    for (; it != fs::directory_iterator{}; it.increment(ec))
+    {
+        if (ec)
+        {
+            return KvError::NoError;
+        }
+        // Synchronous readdir+stat per entry; a partition dir with many data
+        // files can otherwise hold the worker thread for tens of ms in one
+        // uninterrupted segment. Yield once the budget is exceeded.
+        MaybeYield();
+        const std::string name = it->path().filename();
         if (boost::algorithm::ends_with(name, TmpSuffix))
         {
             // Skip temporary files.
@@ -403,7 +473,8 @@ void ClassifyFiles(const std::vector<std::string> &files,
                    std::vector<std::string> &archive_branch_names,
                    std::vector<std::string> &data_files,
                    std::vector<uint64_t> &manifest_terms,
-                   std::vector<std::string> &manifest_branch_names)
+                   std::vector<std::string> &manifest_branch_names,
+                   std::vector<std::string> *segment_files)
 {
     archive_files.clear();
     archive_tags.clear();
@@ -412,9 +483,21 @@ void ClassifyFiles(const std::vector<std::string> &files,
     manifest_terms.clear();
     manifest_branch_names.clear();
     data_files.reserve(files.size());
+    if (segment_files != nullptr)
+    {
+        segment_files->clear();
+    }
 
+    uint64_t poll_i = 0;
     for (const std::string &file_name : files)
     {
+        // Per-file CPU parse; with many accumulated files this loop can hold
+        // the worker thread for tens of ms. Poll the yield budget amortized
+        // (kYieldPollStride) so the clock read is not paid on every file.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
         // Ignore temporary files.
         if (boost::algorithm::ends_with(file_name, TmpSuffix))
         {
@@ -456,6 +539,10 @@ void ClassifyFiles(const std::vector<std::string> &files,
             // data file: data_<file_id>
             data_files.push_back(file_name);
         }
+        else if (ret.first == FileNameSegment && segment_files != nullptr)
+        {
+            segment_files->push_back(file_name);
+        }
         // Ignore other types of files.
     }
 }
@@ -490,15 +577,17 @@ KvError ReadCloudFile(const TableIdent &tbl_id,
 }
 
 // Helper: process one manifest file (regular or archive) — replay it,
-// add all referenced file IDs to retained_files, and update
-// max_file_id_per_branch_term from BranchManifestMetadata.file_ranges.
+// add all referenced file IDs to retained_files / retained_segment_files,
+// and fold every BranchFileRange into branch_guards.
 static KvError ProcessOneManifest(
     const std::string &filename,
     uint64_t term,
     DirectIoBuffer &buf,
     absl::flat_hash_set<RetainedFileKey> &retained_files,
-    absl::flat_hash_map<std::string, FileId> &max_file_id_per_branch_term,
-    uint8_t pages_per_file_shift)
+    absl::flat_hash_set<RetainedFileKey> &retained_segment_files,
+    BranchGuardMap &branch_guards,
+    uint8_t pages_per_file_shift,
+    uint8_t segments_per_file_shift)
 {
     MemStoreMgr::Manifest manifest(buf.view());
     Replayer replayer(Options());
@@ -516,22 +605,54 @@ static KvError ProcessOneManifest(
     GetRetainedFiles(retained_files,
                      replayer.mapping_tbl_,
                      replayer.branch_metadata_.file_ranges,
-                     pages_per_file_shift);
+                     pages_per_file_shift,
+                     /*is_segment=*/false);
+    GetRetainedFiles(retained_segment_files,
+                     replayer.segment_mapping_tbl_,
+                     replayer.branch_metadata_.file_ranges,
+                     segments_per_file_shift,
+                     /*is_segment=*/true);
 
-    // Update max_file_id_per_branch_term from all file_ranges in this manifest.
+    // For each branch, keep the newest term and the highest data/segment
+    // file ids observed at that term. Per-branch in-flight protection then
+    // only applies to files at the newest term; older-term files for the
+    // same branch are by definition already complete.
     for (const BranchFileRange &range : replayer.branch_metadata_.file_ranges)
     {
-        std::string key = range.branch_name + "_" + std::to_string(range.term);
-        auto it = max_file_id_per_branch_term.find(key);
-        if (it == max_file_id_per_branch_term.end() ||
-            range.max_file_id > it->second)
+        // range.max_file_id_ is the highest file_id reached at flush time
+        // (inclusive). Under "least_unflushed" semantics, the file at that id
+        // may still be partially flushed, so it itself is protected. The
+        // numeric value is the same; only the >= comparison in the retention
+        // check differs from a strict `>` against the legacy "max" field.
+        auto [it, inserted] = branch_guards.try_emplace(
+            range.branch_name_,
+            BranchGuard{
+                range.term_, range.max_file_id_, range.max_segment_file_id_});
+        if (inserted)
         {
-            max_file_id_per_branch_term[key] = range.max_file_id;
+            continue;
         }
+        BranchGuard &g = it->second;
+        if (range.term_ > g.newest_term_)
+        {
+            g.newest_term_ = range.term_;
+            g.least_unflushed_file_id_ = range.max_file_id_;
+            g.least_unflushed_seg_file_id_ = range.max_segment_file_id_;
+        }
+        else if (range.term_ == g.newest_term_)
+        {
+            g.least_unflushed_file_id_ =
+                std::max(g.least_unflushed_file_id_, range.max_file_id_);
+            g.least_unflushed_seg_file_id_ = std::max(
+                g.least_unflushed_seg_file_id_, range.max_segment_file_id_);
+        }
+        // term < newest_term_: ignore (historical or cross-branch reference).
     }
 
     DLOG(INFO) << "ProcessOneManifest: processed " << filename
-               << ", retained_files now size=" << retained_files.size();
+               << ", retained_files now size=" << retained_files.size()
+               << ", retained_segment_files now size="
+               << retained_segment_files.size();
     return KvError::NoError;
 }
 
@@ -542,8 +663,10 @@ KvError AugmentRetainedFilesFromBranchManifests(
     const std::vector<std::string> &archive_files,
     const std::vector<std::string> &archive_branch_names,
     absl::flat_hash_set<RetainedFileKey> &retained_files,
-    absl::flat_hash_map<std::string, FileId> &max_file_id_per_branch_term,
+    absl::flat_hash_set<RetainedFileKey> &retained_segment_files,
+    BranchGuardMap &branch_guards,
     uint8_t pages_per_file_shift,
+    uint8_t segments_per_file_shift,
     IouringMgr *io_mgr)
 {
     assert(manifest_branch_names.size() == manifest_terms.size());
@@ -553,11 +676,45 @@ KvError AugmentRetainedFilesFromBranchManifests(
     CloudStoreMgr *cloud_mgr =
         is_cloud ? static_cast<CloudStoreMgr *>(io_mgr) : nullptr;
 
+    // Optimization: the active branch's current-term retained files were
+    // already derived from the in-memory mapping by BuildRetainedFiles, and
+    // its in-flight guard by SeedActiveBranchGuardFromInMemory -- and the
+    // in-memory RootMeta is at least as current as the on-disk active-branch
+    // manifest (see the rationale in ExecuteLocalGC step 2a). So re-reading
+    // and replaying the active branch's current manifest from disk here is
+    // pure redundant work -- the dominant GC:Augment cost (manifest replay +
+    // full mapping-table walk on every compaction). Skip it, but ONLY when a
+    // non-stub in-memory RootMeta is present -- the same condition under which
+    // BuildRetainedFiles actually populated retained_files from memory:
+    // FindRoot returns NotFound for a stub RootMeta (mapper_ == nullptr) and
+    // BuildRetainedFiles then leaves the active branch with no retained files,
+    // so matching that predicate here avoids skipping the disk manifest when
+    // memory in fact holds nothing for the active branch. Non-active branches
+    // and archives still go through disk: they may be updated by other
+    // instances and have no trustworthy in-memory mapping here.
+    const std::string_view active_branch = io_mgr->GetActiveBranch();
+    const uint64_t active_term = io_mgr->ProcessTerm();
+    // Pure in-memory, no load/yield: mirror FindRoot's stub detection
+    // (mapper_ == nullptr -> NotFound) without its side effects. No yields
+    // between Find() and the mapper_ read, so the entry cannot be evicted.
+    RootMetaMgr::Entry *active_entry =
+        shard != nullptr
+            ? shard->IndexManager()->RootMetaManager()->Find(tbl_id)
+            : nullptr;
+    const bool active_in_memory =
+        active_entry != nullptr && active_entry->meta_.mapper_ != nullptr;
+
     // --- Process regular manifests ---
     for (size_t i = 0; i < manifest_branch_names.size(); ++i)
     {
+        MaybeYield();
         const std::string &branch = manifest_branch_names[i];
         uint64_t term = manifest_terms[i];
+        if (active_in_memory && term == active_term && branch == active_branch)
+        {
+            // Already covered from memory; avoid the redundant replay.
+            continue;
+        }
         std::string filename = BranchManifestFileName(branch, term);
 
         DirectIoBuffer buf;
@@ -578,8 +735,10 @@ KvError AugmentRetainedFilesFromBranchManifests(
                                      term,
                                      buf,
                                      retained_files,
-                                     max_file_id_per_branch_term,
-                                     pages_per_file_shift);
+                                     retained_segment_files,
+                                     branch_guards,
+                                     pages_per_file_shift,
+                                     segments_per_file_shift);
             if (err != KvError::NoError)
             {
                 return err;
@@ -637,8 +796,10 @@ KvError AugmentRetainedFilesFromBranchManifests(
                                  term,
                                  buf,
                                  retained_files,
-                                 max_file_id_per_branch_term,
-                                 pages_per_file_shift);
+                                 retained_segment_files,
+                                 branch_guards,
+                                 pages_per_file_shift,
+                                 segments_per_file_shift);
         if (err != KvError::NoError)
         {
             return err;
@@ -757,21 +918,37 @@ KvError DeleteOldArchives(const TableIdent &tbl_id,
     return KvError::NoError;
 }
 
+KvError DownloadArchiveFile(const TableIdent &tbl_id,
+                            const std::string &archive_file,
+                            std::string &content,
+                            CloudStoreMgr *cloud_mgr,
+                            const KvOptions * /*options*/)
+{
+    DirectIoBuffer buf;
+    KvError err = ReadCloudFile(tbl_id, archive_file, buf, cloud_mgr);
+    if (err == KvError::NoError)
+    {
+        content = std::string(buf.view());
+    }
+    return err;
+}
+
 KvError DeleteUnreferencedCloudFiles(
     const TableIdent &tbl_id,
     const std::vector<std::string> &data_files,
     const std::vector<uint64_t> &manifest_terms,
     const std::vector<std::string> &manifest_branch_names,
     const absl::flat_hash_set<RetainedFileKey> &retained_files,
-    const absl::flat_hash_map<std::string, FileId> &max_file_id_per_branch_term,
+    const BranchGuardMap &branch_guards,
     std::vector<std::string> &deleted_filenames,
     CloudStoreMgr *cloud_mgr)
 {
     std::vector<std::string> files_to_delete;
     std::vector<std::string> basenames_to_delete;
-    auto process_term = cloud_mgr->ProcessTerm();
+    const uint64_t process_term = cloud_mgr->ProcessTerm();
+    const std::string_view active_branch = cloud_mgr->GetActiveBranch();
     const std::string current_manifest =
-        BranchManifestFileName(cloud_mgr->GetActiveBranch(), process_term);
+        BranchManifestFileName(active_branch, process_term);
     deleted_filenames.clear();
 
     for (const std::string &file_name : data_files)
@@ -805,19 +982,31 @@ KvError DeleteUnreferencedCloudFiles(
             continue;
         }
 
-        // Check max_file_id_per_branch_term to detect in-flight writes.
-        std::string key = std::string(branch_name) + "_" + std::to_string(term);
-        auto it = max_file_id_per_branch_term.find(key);
-        if (it != max_file_id_per_branch_term.end() && file_id > it->second)
+        // In-flight write guard. A missing guard for the active branch means
+        // its manifest was dropped/reopened and the unretained file can be
+        // deleted. For other branches, missing guard means we do not have a
+        // flushed boundary, so preserve the file conservatively.
+        absl::string_view absl_branch(branch_name.data(), branch_name.size());
+        auto it = branch_guards.find(absl_branch);
+        if (it == branch_guards.end())
         {
-            // file_id beyond known max → in-flight write, preserve.
+            if (branch_name != active_branch)
+            {
+                DLOG(INFO) << "skip file " << file_name
+                           << " (missing branch guard for non-active branch "
+                           << branch_name << ")";
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_file_id_)
+        {
             DLOG(INFO) << "skip file " << file_name << " (file_id=" << file_id
-                       << " > max_known=" << it->second << ", in-flight)";
+                       << " >= least_unflushed="
+                       << it->second.least_unflushed_file_id_ << ", in-flight)";
             continue;
         }
 
-        // No map entry → deleted/orphaned branch; or file_id within known
-        // range and not retained → safe to delete.
         std::string remote_path = tbl_id.ToString() + "/" + file_name;
         files_to_delete.push_back(remote_path);
         basenames_to_delete.push_back(file_name);
@@ -827,10 +1016,9 @@ KvError DeleteUnreferencedCloudFiles(
     {
         // Every data file for this table is unreferenced and will be deleted.
         // The active branch's manifest is now empty, so delete it too rather
-        // than leaving a stale manifest in cloud storage.  We use
-        // GetActiveBranch() directly (instead of scanning by term alone)
-        // because multiple branches may share the same term value.
-        std::string_view active_branch = cloud_mgr->GetActiveBranch();
+        // than leaving a stale manifest in cloud storage.  We use the caller-
+        // supplied active_branch (instead of scanning by term alone) because
+        // multiple branches may share the same term value.
         bool found_current = false;
         for (size_t i = 0; i < manifest_terms.size(); ++i)
         {
@@ -864,8 +1052,6 @@ KvError DeleteUnreferencedCloudFiles(
     // to prune. Manifests for OTHER branches are managed by DeleteBranch and
     // must not be deleted here.
     {
-        // Use the known active branch directly rather than scanning by term.
-        std::string_view active_branch = cloud_mgr->GetActiveBranch();
         for (size_t i = 0; i < manifest_terms.size(); ++i)
         {
             if (manifest_terms[i] < process_term &&
@@ -954,7 +1140,7 @@ KvError DeleteUnreferencedLocalFiles(
     const TableIdent &tbl_id,
     const std::vector<std::string> &data_files,
     const absl::flat_hash_set<RetainedFileKey> &retained_files,
-    const absl::flat_hash_map<std::string, FileId> &max_file_id_per_branch_term,
+    const BranchGuardMap &branch_guards,
     IouringMgr *io_mgr)
 {
     namespace fs = std::filesystem;
@@ -962,12 +1148,21 @@ KvError DeleteUnreferencedLocalFiles(
                                          io_mgr->options_->store_path_lut);
 
     std::vector<std::string> files_to_delete;
-    std::vector<FileId> file_ids_to_close;
+    std::vector<std::string> filenames_to_delete;
+    std::vector<TypedFileId> file_ids_to_close;
     files_to_delete.reserve(data_files.size());
+    filenames_to_delete.reserve(data_files.size());
     file_ids_to_close.reserve(data_files.size());
 
+    uint64_t poll_i = 0;
     for (const std::string &file_name : data_files)
     {
+        // Cheap per-file parse: amortize the yield-budget check
+        // (kYieldPollStride) instead of reading the clock every iteration.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
         auto ret = ParseFileName(file_name);
         if (ret.first != FileNameData)
         {
@@ -992,23 +1187,35 @@ KvError DeleteUnreferencedLocalFiles(
             continue;
         }
 
-        // Check max_file_id_per_branch_term to detect in-flight writes.
-        std::string key = std::string(branch_name) + "_" + std::to_string(term);
-        auto it = max_file_id_per_branch_term.find(key);
-        if (it != max_file_id_per_branch_term.end() && file_id > it->second)
+        // In-flight write guard. A missing guard for the active branch means
+        // its manifest was dropped/reopened and the unretained file can be
+        // deleted. For other branches, missing guard means we do not have a
+        // flushed boundary, so preserve the file conservatively.
+        absl::string_view absl_branch(branch_name.data(), branch_name.size());
+        auto it = branch_guards.find(absl_branch);
+        if (it == branch_guards.end())
         {
-            // file_id beyond known max → in-flight write, preserve.
+            if (branch_name != io_mgr->GetActiveBranch())
+            {
+                DLOG(INFO) << "ExecuteLocalGC: keep file " << file_name
+                           << " (missing branch guard for non-active branch "
+                           << branch_name << ")";
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_file_id_)
+        {
             DLOG(INFO) << "ExecuteLocalGC: keep file " << file_name
-                       << " (file_id=" << file_id
-                       << " > max_known=" << it->second << ", in-flight)";
+                       << " (file_id=" << file_id << " >= least_unflushed="
+                       << it->second.least_unflushed_file_id_ << ", in-flight)";
             continue;
         }
 
-        // No map entry → deleted/orphaned branch; or file_id within known
-        // range and not retained → safe to delete.
         fs::path file_path = dir_path / file_name;
         files_to_delete.push_back(file_path.string());
-        file_ids_to_close.push_back(file_id);
+        filenames_to_delete.push_back(file_name);
+        file_ids_to_close.push_back(DataFileKey(file_id));
         DLOG(INFO) << "ExecuteLocalGC: marking file for deletion: " << file_name
                    << " (file_id=" << file_id << ")";
     }
@@ -1017,6 +1224,9 @@ KvError DeleteUnreferencedLocalFiles(
                << files_to_delete.size();
     if (!files_to_delete.empty())
     {
+        // Keep the fdatasync (see the matching note in
+        // DeleteUnreferencedLocalSegmentFiles): skipping it makes the stall
+        // ~10x worse via uncontrolled kernel writeback.
         KvError close_err = io_mgr->CloseFiles(tbl_id, file_ids_to_close);
         if (close_err != KvError::NoError)
         {
@@ -1025,16 +1235,27 @@ KvError DeleteUnreferencedLocalFiles(
                        << static_cast<int>(close_err);
             return close_err;
         }
-        // Delete files using batch operation
-        KvError delete_err = io_mgr->DeleteFiles(files_to_delete);
-        if (delete_err != KvError::NoError)
+
+        if (eloq_store->Mode() == StoreMode::Cloud)
         {
-            LOG(ERROR) << "ExecuteLocalGC: Failed to delete files, error: "
-                       << static_cast<int>(delete_err);
-            return delete_err;
+            static_cast<CloudStoreMgr *>(io_mgr)->ScheduleLocalFileCleanup(
+                tbl_id, filenames_to_delete);
+            DLOG(INFO) << "ExecuteLocalGC: scheduled " << files_to_delete.size()
+                       << " unreferenced files for local cache cleanup";
         }
-        DLOG(INFO) << "ExecuteLocalGC: Successfully deleted "
-                   << files_to_delete.size() << " unreferenced files";
+        else
+        {
+            // Delete files using batch operation
+            KvError delete_err = io_mgr->DeleteFiles(files_to_delete);
+            if (delete_err != KvError::NoError)
+            {
+                LOG(ERROR) << "ExecuteLocalGC: Failed to delete files, error: "
+                           << static_cast<int>(delete_err);
+                return delete_err;
+            }
+            DLOG(INFO) << "ExecuteLocalGC: Successfully deleted "
+                       << files_to_delete.size() << " unreferenced files";
+        }
     }
     else
     {
@@ -1044,8 +1265,231 @@ KvError DeleteUnreferencedLocalFiles(
     return KvError::NoError;
 }
 
+KvError DeleteUnreferencedLocalSegmentFiles(
+    const TableIdent &tbl_id,
+    const std::vector<std::string> &segment_files,
+    const RetainedFiles &retained_segment_files,
+    const BranchGuardMap &branch_guards,
+    IouringMgr *io_mgr)
+{
+    namespace fs = std::filesystem;
+    fs::path dir_path = tbl_id.StorePath(io_mgr->options_->store_path,
+                                         io_mgr->options_->store_path_lut);
+
+    std::vector<std::string> files_to_delete;
+    std::vector<std::string> filenames_to_delete;
+    std::vector<TypedFileId> file_ids_to_close;
+    files_to_delete.reserve(segment_files.size());
+    filenames_to_delete.reserve(segment_files.size());
+    file_ids_to_close.reserve(segment_files.size());
+
+    uint64_t poll_i = 0;
+    for (const std::string &file_name : segment_files)
+    {
+        // Cheap per-file parse: amortize the yield-budget check
+        // (kYieldPollStride) instead of reading the clock every iteration.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
+        auto ret = ParseFileName(file_name);
+        if (ret.first != FileNameSegment)
+        {
+            continue;
+        }
+
+        FileId file_id = 0;
+        std::string_view branch_name;
+        uint64_t term = 0;
+        if (!ParseSegmentFileSuffix(ret.second, file_id, branch_name, term))
+        {
+            continue;
+        }
+
+        if (retained_segment_files.contains(
+                RetainedFileKey{file_id, std::string(branch_name), term}))
+        {
+            continue;
+        }
+
+        // In-flight write guard. Missing guard keeps non-active branches
+        // conservative, but does not protect the active branch after its
+        // manifest was dropped/reopened.
+        absl::string_view absl_branch(branch_name.data(), branch_name.size());
+        auto it = branch_guards.find(absl_branch);
+        if (it == branch_guards.end())
+        {
+            if (branch_name != io_mgr->GetActiveBranch())
+            {
+                DLOG(INFO) << "ExecuteLocalGC: keep segment file " << file_name
+                           << " (missing branch guard for non-active branch "
+                           << branch_name << ")";
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_seg_file_id_)
+        {
+            DLOG(INFO) << "ExecuteLocalGC: keep segment file " << file_name
+                       << " (file_id=" << file_id << " >= least_unflushed="
+                       << it->second.least_unflushed_seg_file_id_
+                       << ", in-flight)";
+            continue;
+        }
+
+        fs::path file_path = dir_path / file_name;
+        files_to_delete.push_back(file_path.string());
+        filenames_to_delete.push_back(file_name);
+        file_ids_to_close.push_back(SegmentFileKey(file_id));
+    }
+
+    if (files_to_delete.empty())
+    {
+        return KvError::NoError;
+    }
+
+    // NOTE: keep the fdatasync (CloseFiles unconditionally fdatasyncs dirty
+    // FDs before closing) even though these files are about to be unlinked.
+    // Skipping it does NOT save the I/O -- it lets dirty pages accumulate and
+    // the kernel flushes them in an uncontrolled synchronous burst at
+    // close()/unlink(), which measured ~10x WORSE (one GC segment 365ms vs
+    // 25ms, write-heavy overwrite workload). The explicit batched io_uring
+    // fdatasync here is controlled writeback.
+    KvError close_err = io_mgr->CloseFiles(tbl_id, file_ids_to_close);
+    if (close_err != KvError::NoError)
+    {
+        LOG(ERROR)
+            << "ExecuteLocalGC: failed to close segment files before deletion, "
+               "error: "
+            << static_cast<int>(close_err);
+        return close_err;
+    }
+    if (eloq_store->Mode() == StoreMode::Cloud)
+    {
+        static_cast<CloudStoreMgr *>(io_mgr)->ScheduleLocalFileCleanup(
+            tbl_id, filenames_to_delete);
+        DLOG(INFO) << "ExecuteLocalGC: scheduled " << files_to_delete.size()
+                   << " unreferenced segment files for local cache cleanup";
+    }
+    else
+    {
+        KvError delete_err = io_mgr->DeleteFiles(files_to_delete);
+        if (delete_err != KvError::NoError)
+        {
+            LOG(ERROR)
+                << "ExecuteLocalGC: failed to delete segment files, error: "
+                << static_cast<int>(delete_err);
+            return delete_err;
+        }
+        DLOG(INFO) << "ExecuteLocalGC: deleted " << files_to_delete.size()
+                   << " unreferenced segment files";
+    }
+    return KvError::NoError;
+}
+
+KvError DeleteUnreferencedCloudSegmentFiles(
+    const TableIdent &tbl_id,
+    const std::vector<std::string> &segment_files,
+    const RetainedFiles &retained_segment_files,
+    const BranchGuardMap &branch_guards,
+    CloudStoreMgr *cloud_mgr)
+{
+    std::vector<std::string> files_to_delete;
+    const uint64_t process_term = cloud_mgr->ProcessTerm();
+
+    uint64_t poll_i = 0;
+    for (const std::string &file_name : segment_files)
+    {
+        // Cheap per-file parse: amortize the yield-budget check
+        // (kYieldPollStride) instead of reading the clock every iteration.
+        if (poll_i++ % kYieldPollStride == 0)
+        {
+            MaybeYield();
+        }
+        auto ret = ParseFileName(file_name);
+        if (ret.first != FileNameSegment)
+        {
+            continue;
+        }
+
+        FileId file_id = 0;
+        std::string_view branch_name;
+        uint64_t term = 0;
+        if (!ParseSegmentFileSuffix(ret.second, file_id, branch_name, term))
+        {
+            LOG(ERROR) << "Failed to parse segment file suffix: " << file_name
+                       << ", skipping";
+            continue;
+        }
+
+        if (term > process_term)
+        {
+            continue;
+        }
+
+        if (retained_segment_files.contains(
+                RetainedFileKey{file_id, std::string(branch_name), term}))
+        {
+            continue;
+        }
+
+        // In-flight write guard. Mirrors the data-file path's missing-guard
+        // handling: active branch can be collected, non-active branches are
+        // preserved conservatively.
+        absl::string_view absl_branch(branch_name.data(), branch_name.size());
+        auto it = branch_guards.find(absl_branch);
+        if (it == branch_guards.end())
+        {
+            if (branch_name != cloud_mgr->GetActiveBranch())
+            {
+                continue;
+            }
+        }
+        else if (term >= it->second.newest_term_ &&
+                 file_id >= it->second.least_unflushed_seg_file_id_)
+        {
+            continue;
+        }
+
+        files_to_delete.emplace_back(tbl_id.ToString() + "/" + file_name);
+    }
+
+    if (files_to_delete.empty())
+    {
+        return KvError::NoError;
+    }
+
+    KvTask *current_task = ThdTask();
+    std::vector<ObjectStore::DeleteTask> delete_tasks;
+    delete_tasks.reserve(files_to_delete.size());
+
+    for (const std::string &remote_path : files_to_delete)
+    {
+        delete_tasks.emplace_back(remote_path);
+        ObjectStore::DeleteTask &task = delete_tasks.back();
+        task.SetKvTask(current_task);
+        cloud_mgr->AcquireCloudSlot(current_task);
+        cloud_mgr->GetObjectStore().SubmitTask(&task, shard);
+    }
+
+    current_task->WaitIo();
+
+    for (const auto &task : delete_tasks)
+    {
+        if (task.error_ != KvError::NoError)
+        {
+            LOG(ERROR) << "Failed to delete segment file " << task.remote_path_
+                       << ": " << ErrorString(task.error_);
+            return task.error_;
+        }
+    }
+
+    return KvError::NoError;
+}
+
 KvError ExecuteCloudGC(const TableIdent &tbl_id,
                        RetainedFiles &retained_files,
+                       RetainedFiles &retained_segment_files,
                        CloudStoreMgr *cloud_mgr)
 {
     // Check term file before proceeding
@@ -1094,13 +1538,15 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
     std::vector<std::string> data_files;
     std::vector<uint64_t> manifest_terms;
     std::vector<std::string> manifest_branch_names;
+    std::vector<std::string> segment_files;
     ClassifyFiles(cloud_files,
                   archive_files,
                   archive_tags,
                   archive_branch_names,
                   data_files,
                   manifest_terms,
-                  manifest_branch_names);
+                  manifest_branch_names,
+                  &segment_files);
 
     // 3. check if term expired to avoid deleting invisible files.
     for (auto term : manifest_terms)
@@ -1111,9 +1557,20 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
         }
     }
 
-    // 3a. augment retained_files from all branch manifests (regular + archive)
-    // in cloud; also build max_file_id_per_branch_term map.
-    absl::flat_hash_map<std::string, FileId> max_file_id_per_branch_term;
+    // 3a. augment retained_files / retained_segment_files from all branch
+    // manifests (regular + archive) in cloud and build branch_guards. The
+    // local active branch's in-memory RootMeta tracks the boundary of the
+    // flushed region (RootMeta::first_unflushed_*_fp_id_) more currently
+    // than any remote manifest does, so we seed the active branch guard
+    // from there.
+    BranchGuardMap branch_guards;
+    SeedActiveBranchGuardFromInMemory(
+        tbl_id,
+        cloud_mgr->GetActiveBranch(),
+        process_term,
+        cloud_mgr->options_->pages_per_file_shift,
+        cloud_mgr->options_->segments_per_file_shift,
+        branch_guards);
     err = AugmentRetainedFilesFromBranchManifests(
         tbl_id,
         manifest_branch_names,
@@ -1121,8 +1578,10 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
         archive_files,
         archive_branch_names,
         retained_files,
-        max_file_id_per_branch_term,
+        retained_segment_files,
+        branch_guards,
         cloud_mgr->options_->pages_per_file_shift,
+        cloud_mgr->options_->segments_per_file_shift,
         static_cast<IouringMgr *>(cloud_mgr));
     if (err != KvError::NoError)
     {
@@ -1139,7 +1598,7 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
                                        manifest_terms,
                                        manifest_branch_names,
                                        retained_files,
-                                       max_file_id_per_branch_term,
+                                       branch_guards,
                                        deleted_filenames,
                                        cloud_mgr);
     if (err != KvError::NoError)
@@ -1158,23 +1617,18 @@ KvError ExecuteCloudGC(const TableIdent &tbl_id,
         }
     }
 
-    /*
-    // 5. delete old archives beyond num_retained_archives per branch.
-    // NOTE: intentionally AFTER DeleteUnreferencedCloudFiles so all archives
-    // contribute their file IDs to retained_files before any are pruned.
-    err = DeleteOldArchives(tbl_id,
-                            archive_files,
-                            archive_tags,
-                            archive_branch_names,
-                            cloud_mgr->options_->num_retained_archives,
-                            static_cast<IouringMgr *>(cloud_mgr));
+    // 5. delete unreferenced segment files. See the matching note in
+    // ExecuteLocalGC: archive-referenced segments are already in
+    // retained_segment_files via AugmentRetainedFilesFromBranchManifests.
+    err = DeleteUnreferencedCloudSegmentFiles(tbl_id,
+                                              segment_files,
+                                              retained_segment_files,
+                                              branch_guards,
+                                              cloud_mgr);
     if (err != KvError::NoError)
     {
-        LOG(ERROR) << "ExecuteCloudGC: DeleteOldArchives failed, error="
-                   << static_cast<int>(err);
         return err;
     }
-    */
 
     return KvError::NoError;
 }

@@ -13,6 +13,8 @@
 #include "utils.h"
 namespace eloqstore
 {
+class GlobalRegisteredMemory;
+
 constexpr int KB = 1 << 10;
 constexpr int MB = 1 << 20;
 constexpr int GB = 1 << 30;
@@ -20,6 +22,8 @@ constexpr int64_t TB = 1LL << 40;
 
 constexpr uint8_t max_overflow_pointers = 128;
 constexpr uint16_t max_read_pages_batch = max_overflow_pointers;
+constexpr uint16_t max_segments_batch = 8;
+
 struct KvOptions
 {
     int LoadFromIni(const char *path);
@@ -42,9 +46,16 @@ struct KvOptions
      */
     bool skip_verify_checksum = false;
     /**
-     * @brief Max size of cached index pages per shard (in bytes).
+     * @brief Max size of cached index pages per shard (in bytes). When
+     * enable_data_page_cache is on, cached data pages share the same budget.
      */
-    uint64_t buffer_pool_size = 32 * MB;
+    uint64_t buffer_pool_size = 128 * MB;
+    /**
+     * @brief If true, data pages are cached in the same buffer pool as index
+     * pages, evicted by the same LRU. If false (default), every data-page
+     * access reads from storage.
+     */
+    bool enable_data_page_cache = false;
     /**
      * @brief Max size of cached RootMeta mappings (global, in bytes).
      */
@@ -103,6 +114,26 @@ struct KvOptions
      */
     uint8_t file_amplify_factor = 2;
     /**
+     * @brief Move segments in a segment file when its space amplification
+     * factor exceeds this value. A value of 0 disables segment file
+     * compaction independently of data file compaction. Default is 2
+     * (same as file_amplify_factor today, but the two knobs are
+     * independent); segment rewrites are ~two orders of magnitude more
+     * expensive per unit than page rewrites, so this can be raised to
+     * prefer space over churn.
+     * Only takes effect when data_append_mode is enabled.
+     */
+    uint8_t segment_file_amplify_factor = 2;
+    /**
+     * @brief Yield to low-priority queue after processing this many
+     * segments during background segment compaction. Each segment is
+     * 128KB-512KB, so the page-compaction yield cadence would hold the
+     * coroutine far longer between yields; a smaller value protects
+     * foreground read/write tail latency. Set to 0 to disable intra-file
+     * yielding (outer loops still yield between files).
+     */
+    uint32_t segment_compact_yield_every = max_segments_batch;
+    /**
      * @brief Limit total size of local files.
      * Only take effect when cloud store is enabled.
      */
@@ -157,6 +188,77 @@ struct KvOptions
      * store starts.
      */
     bool allow_reuse_local_caches = false;
+    /**
+     * @brief The chunk size of a big string in local storage.
+     */
+    uint32_t chunk_size = 256;
+    /**
+     * @brief The segment size in GlobalRegisteredMemory for storing very large
+     * strings. Default 256 KB. Must be 4 KB aligned.
+     */
+    uint32_t segment_size = 256 * KB;
+    /**
+     * @brief Per-shard pointers to GlobalRegisteredMemory instances owned
+     * externally (by the surrounding system that also hosts the networking
+     * module and in-memory cache). When non-empty, must have exactly
+     * num_threads entries; each instance is registered with that shard's
+     * io_uring and used for zero-copy very-large-value I/O. Leave empty to
+     * disable the feature on this EloqStore instance.
+     *
+     * Mutually exclusive with `pinned_memory_chunks` (KV Cache mode).
+     */
+    std::vector<GlobalRegisteredMemory *> global_registered_memories;
+    /**
+     * @brief Raw pinned memory chunks owned by KV Cache (PyTorch-registered).
+     * When non-empty, EloqStore registers these chunks in every shard's
+     * io_uring as fixed buffers for zero-copy reads/writes of very large
+     * values. Unlike `global_registered_memories`, the chunks are shared
+     * across all shards (KV Cache manages them centrally) and each shard's
+     * ring registers them independently. Each chunk's base address and size
+     * must be 4 KiB aligned. Leave empty to disable KV Cache mode.
+     *
+     * Mutually exclusive with `global_registered_memories`.
+     */
+    std::vector<std::pair<char *, size_t>> pinned_memory_chunks;
+    /**
+     * @brief Per-shard capacity for the internal GlobalRegisteredMemory
+     * EloqStore allocates in KV Cache mode (pinned_memory_chunks non-empty)
+     * to back GC and compaction reads/writes. Online reads/writes use the
+     * caller's pinned chunks; background tasks (GC, compaction) cannot,
+     * because EloqStore does not manage their lifetime, so an internal pool
+     * is required. Default 32 MiB; must satisfy
+     * `max_segments_batch * segment_size <= gc_global_mem_size_per_shard`.
+     */
+    size_t gc_global_mem_size_per_shard = 32ULL * MB;
+    /**
+     * @brief Number of segment-sized scratch slots EloqStore allocates per
+     * shard to back the pinned-write tail fallback. Only meaningful when
+     * `pinned_memory_chunks` is non-empty.
+     *
+     * Background: a pinned write of `size` bytes flushes K = ceil(size /
+     * segment_size) full segments to disk. When `size` does not divide
+     * `segment_size`, the kernel's fixed write of the final segment reads
+     * `K*segment_size - size` bytes past the caller's logical value end.
+     * If those trailing bytes still lie inside the caller's registered
+     * chunk (the common case), no scratch is needed and the write is
+     * zero-copy. If they fall outside the registered chunk (the caller's
+     * pinned sub-range ends at a chunk boundary or has no slack), EloqStore
+     * acquires one of these scratch slots, copies the meaningful tail into
+     * it, zero-pads the rest, and writes from there instead.
+     *
+     * Each slot is `segment_size` bytes. Defaults to `max_segments_batch`
+     * (sized to bound concurrent tail-fallback writes per shard). Set to 0
+     * to disable the fallback -- the caller must then guarantee that
+     * `[ptr, ptr + K*segment_size)` is fully inside one registered chunk
+     * for every pinned write.
+     */
+    uint16_t pinned_tail_scratch_slots = max_segments_batch;
+    /**
+     * @brief Number of segments per segment file (1 <<
+     * segments_per_file_shift). Default 7 means 128 segments per file (32MB
+     * file at 256KB segment).
+     */
+    uint8_t segments_per_file_shift = 7;
 
     /* NOTE:
      * The following options will be persisted in storage, so after the first
@@ -266,6 +368,11 @@ struct KvOptions
         return static_cast<size_t>(data_page_size) << pages_per_file_shift;
     }
 
+    size_t SegmentFileSize() const
+    {
+        return static_cast<size_t>(segment_size) << segments_per_file_shift;
+    }
+
     /**
      * @brief Amount of pages per data file (1 << pages_per_file_shift).
      * It is recommended to set a smaller file size like 4MB in append write
@@ -312,6 +419,7 @@ struct KvOptions
      * missing underlying resources in cloud/standby mode.
      */
     uint8_t auto_reopen_retry_times = 10;
+    uint8_t auto_oom_retry_times = 5;
 
     /**
      * @brief Filter function to determine which partitions belong to this

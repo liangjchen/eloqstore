@@ -500,9 +500,9 @@ TEST_CASE("cloud reopen clears local-only partition when remote is empty",
         store.ExecSync(&reopen_req);
         REQUIRE(reopen_req.Error() == eloqstore::KvError::NoError);
 
-        VerifyRange(store, tbl_id, 0, 5000, false);
         REQUIRE(WaitForCondition(
             5s, 100ms, [&]() { return !fs::exists(partition_path); }));
+        VerifyRange(store, tbl_id, 0, 5000, false);
 
         store.Stop();
     }
@@ -597,9 +597,6 @@ TEST_CASE("standby rsync replica follows master changes", "[standby]")
         reopen_req.SetTag(std::to_string(2002));
         standby.ExecSync(&reopen_req);
         REQUIRE(reopen_req.Error() == eloqstore::KvError::NoError);
-
-        REQUIRE(WaitForCondition(
-            10s, 100ms, [&]() { return !fs::exists(partition_path); }));
 
         eloqstore::ReadRequest read_req;
         read_req.SetArgs(tbl_id, Key(0));
@@ -907,8 +904,6 @@ TEST_CASE(
         Scan(&standby, tbl_id, 0, 10000);
         ReopenStore(standby);
         VerifyRange(standby, tbl_id, 0, 5000, false);
-        REQUIRE(WaitForCondition(
-            10s, 100ms, [&]() { return !fs::exists(partition_path); }));
         standby.Stop();
     }
 

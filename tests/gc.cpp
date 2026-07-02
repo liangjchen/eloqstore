@@ -146,8 +146,7 @@ bool WaitForCondition(std::chrono::milliseconds timeout,
 }
 }  // namespace
 
-TEST_CASE("local mode truncate removes local partition directory",
-          "[gc][local]")
+TEST_CASE("local mode drop removes local partition directory", "[gc][local]")
 {
     CleanupStore(local_gc_opts);
 
@@ -160,35 +159,15 @@ TEST_CASE("local mode truncate removes local partition directory",
     tester.Validate();
     REQUIRE(CheckLocalPartitionExists(local_gc_opts, tbl_id));
 
-    tester.Truncate(0, true);
+    eloqstore::DropRequest drop_req;
+    drop_req.SetArgs(tbl_id);
+    store->ExecSync(&drop_req);
+    REQUIRE(drop_req.Error() == eloqstore::KvError::NoError);
 
     REQUIRE(WaitForCondition(
         3s,
         20ms,
         [&]() { return !CheckLocalPartitionExists(local_gc_opts, tbl_id); }));
-
-    store->Stop();
-    CleanupStore(local_gc_opts);
-}
-
-TEST_CASE("local mode truncate removes local partition directory after wait",
-          "[gc][local]")
-{
-    CleanupStore(local_gc_opts);
-
-    eloqstore::EloqStore *store = InitStore(local_gc_opts);
-    eloqstore::TableIdent tbl_id = {"gc_local_dir_cleanup", 1};
-    MapVerifier tester(tbl_id, store, false);
-    tester.SetValueSize(1000);
-
-    tester.Upsert(0, 100);
-    tester.Validate();
-    REQUIRE(CheckLocalPartitionExists(local_gc_opts, tbl_id));
-
-    tester.Truncate(0, true);
-    WaitForGC(2);
-
-    REQUIRE_FALSE(CheckLocalPartitionExists(local_gc_opts, tbl_id));
 
     store->Stop();
     CleanupStore(local_gc_opts);
@@ -401,4 +380,115 @@ TEST_CASE("cloud mode repeated truncate with directory purge", "[gc][cloud]")
     }
 
     CleanupStore(cloud_gc_opts);
+}
+
+// Regression test for the in-memory boundary mechanism used by local GC.
+//
+// `WriteTask::FlushManifest` writes the post-flush `MaxFilePageId()` into
+// `cow_meta_.first_unflushed_fp_id_`, which `PageManager::UpdateRoot`
+// propagates into `RootMeta`. `SeedActiveBranchGuardFromInMemory` then reads
+// it and converts to `BranchGuard::least_unflushed_file_id_` via
+// `>> per_file_shift`. The retention check in
+// `DeleteUnreferencedLocalFiles` uses `file_id >= least_unflushed_file_id_`
+// to protect any file at or beyond the flushed boundary.
+//
+// This test exercises three things end-to-end:
+//   1. The producer/consumer contract: a flush bumps the in-memory boundary
+//      and a subsequent GC pass sees it.
+//   2. The boundary math: with the boundary set to the current allocator
+//      high-water mark, the active (boundary) data file is protected even
+//      when something else triggers a GC pass.
+//   3. The cleanup path: once the in-memory mapping is empty, GC deletes
+//      data files while truncate keeps the manifest/partition. A subsequent
+//      DropRequest removes the manifest and partition directory.
+//
+// If `first_unflushed_fp_id_` stops propagating from `CowRootMeta` to
+// `RootMeta`, or `SeedActiveBranchGuardFromInMemory` miscomputes
+// `least_unflushed_file_id_`, or the retention check flips back to a strict
+// `>` without the boundary including the active file, this test fails
+// either at the "in-flight file preserved" assertion, the post-truncate
+// manifest-preserved assertion, or the post-drop directory-removed assertion.
+TEST_CASE("local GC honors in-memory least_unflushed boundary",
+          "[gc][local][boundary]")
+{
+    eloqstore::KvOptions opts = local_gc_opts;
+    opts.store_path = {"/tmp/test-gc-boundary"};
+    CleanupStore(opts);
+
+    eloqstore::EloqStore *store = InitStore(opts);
+    eloqstore::TableIdent tbl_id = {"boundary_test", 1};
+    MapVerifier tester(tbl_id, store, false);
+    tester.SetValueSize(1000);
+
+    // With `pages_per_file_shift = 8` (256 pages per file) and a ~4KB
+    // data_page_size, each data file holds about 1 MB. 2000 values of
+    // ~1 KB each forces the allocator to span at least two files, so we
+    // know data_0 exists and the active file id is >= 1.
+    tester.Upsert(0, 2000);
+    tester.Validate();
+
+    auto count_data_files = [&]()
+    {
+        size_t n = 0;
+        for (const std::string &name : ListLocalPartitionFiles(opts, tbl_id))
+        {
+            if (name.rfind("data_", 0) == 0)
+            {
+                ++n;
+            }
+        }
+        return n;
+    };
+    auto has_manifest_file = [&]()
+    {
+        for (const std::string &name : ListLocalPartitionFiles(opts, tbl_id))
+        {
+            if (name.rfind("manifest_", 0) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    const size_t initial_count = count_data_files();
+    REQUIRE(initial_count >= 2);
+
+    // A subsequent small write into a disjoint key range triggers another
+    // FlushManifest (which bumps `first_unflushed_fp_id_` and so the
+    // guard's `least_unflushed_file_id_`) and a fresh GC pass. None of the
+    // existing data files should disappear: older files stay via
+    // `retained_files` because their pages are still mapped; the active
+    // (boundary) file stays via the in-flight guard. A regression that
+    // miscomputes the boundary -- e.g. forgetting to copy
+    // `first_unflushed_fp_id_` across `UpdateRoot`, or flipping the
+    // retention check back to strict `>` without raising the field by one
+    // -- would let the active file slip out of the in-flight zone and be
+    // deleted here.
+    tester.Upsert(10000, 10010);
+    WaitForGC(1);
+    REQUIRE(count_data_files() >= initial_count);
+
+    // Validate data is still readable after the second flush + GC.
+    tester.Validate();
+
+    // Once the in-memory mapping is emptied by Truncate, every data file
+    // becomes unreferenced, but truncate keeps the manifest so the partition
+    // directory remains.
+    tester.Truncate(0, true);
+    REQUIRE(
+        WaitForCondition(5s, 50ms, [&]() { return count_data_files() == 0; }));
+    REQUIRE(CheckLocalPartitionExists(opts, tbl_id));
+    REQUIRE(has_manifest_file());
+
+    // Drop removes the manifest as well, allowing partition cleanup to remove
+    // the now-empty directory.
+    eloqstore::DropRequest drop_req;
+    drop_req.SetArgs(tbl_id);
+    store->ExecSync(&drop_req);
+    REQUIRE(drop_req.Error() == eloqstore::KvError::NoError);
+    REQUIRE(WaitForCondition(
+        5s, 50ms, [&]() { return !CheckLocalPartitionExists(opts, tbl_id); }));
+
+    store->Stop();
+    CleanupStore(opts);
 }

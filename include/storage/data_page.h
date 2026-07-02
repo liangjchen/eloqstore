@@ -1,10 +1,16 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 
+#include "coding.h"
 #include "comparator.h"
 #include "compression.h"
 #include "kv_options.h"
@@ -13,6 +19,7 @@
 
 namespace eloqstore
 {
+class MemCachedPage;
 class DictCompression;
 enum class ValLenBit : uint8_t
 {
@@ -22,6 +29,213 @@ enum class ValLenBit : uint8_t
     StandaloneCompressed,
     BitsCount
 };
+
+/**
+ * @brief Check if the compression bits (bits 2-3 of value_length) indicate
+ * a very large string stored in segment files. When both bits are set (0b11),
+ * the value content is an array of segment IDs rather than inline data.
+ */
+inline bool IsLargeValueEncoding(uint32_t stored_val_len)
+{
+    uint8_t comp_bits =
+        (stored_val_len >> uint8_t(ValLenBit::DictionaryCompressed)) & 0b11;
+    return comp_bits == 0b11;
+}
+
+// Bit 31 of word0 in the large-value content flags whether a metadata trailer
+// is appended after the segment-id array. Bits 30..0 hold actual_length, which
+// caps very large values at 2 GiB - 1 bytes (well above the 10 MiB workload).
+inline constexpr uint32_t kLargeValueHasMetadataBit = 0x80000000u;
+inline constexpr uint32_t kLargeValueLengthMask = 0x7fffffffu;
+
+/**
+ * @brief Encode large value content.
+ *
+ * Layout when @p metadata is empty (backward compatible):
+ *   [ word0 (4B) | K x uint32_t segment_ids ]
+ *
+ * Layout when @p metadata is non-empty:
+ *   [ word0 (4B) | K x uint32_t segment_ids | uint16_t metadata_length |
+ *     metadata_bytes ]
+ *
+ * word0 holds the has-metadata flag in bit 31 and actual_length in bits 30..0.
+ * K is implied by actual_length and the configured segment_size, so it is not
+ * encoded separately. Decoders recover K via
+ *   K = ceil(actual_length / segment_size).
+ *
+ * @param actual_length True byte length of the very large value. Must fit in
+ * 31 bits.
+ * @param segment_ids Logical segment IDs allocated from the segment mapping.
+ * @param dst Output buffer to append encoded content to.
+ * @param metadata Optional metadata blob. Must be at most 65535 bytes.
+ */
+inline void EncodeLargeValueContent(uint32_t actual_length,
+                                    std::span<const PageId> segment_ids,
+                                    std::string &dst,
+                                    std::string_view metadata = {})
+{
+    assert((actual_length & kLargeValueHasMetadataBit) == 0);
+    assert(metadata.size() <= std::numeric_limits<uint16_t>::max());
+
+    const bool has_metadata = !metadata.empty();
+    const size_t trailer_bytes =
+        has_metadata ? sizeof(uint16_t) + metadata.size() : 0;
+    const size_t offset = dst.size();
+    dst.resize(offset + sizeof(uint32_t) + segment_ids.size() * sizeof(PageId) +
+               trailer_bytes);
+    char *p = dst.data() + offset;
+
+    uint32_t word0 = actual_length;
+    if (has_metadata)
+    {
+        word0 |= kLargeValueHasMetadataBit;
+    }
+    EncodeFixed32(p, word0);
+    p += sizeof(uint32_t);
+
+    for (PageId id : segment_ids)
+    {
+        EncodeFixed32(p, id);
+        p += sizeof(PageId);
+    }
+
+    if (has_metadata)
+    {
+        EncodeFixed16(p, static_cast<uint16_t>(metadata.size()));
+        p += sizeof(uint16_t);
+        std::memcpy(p, metadata.data(), metadata.size());
+    }
+}
+
+/**
+ * @brief Header info parsed from a large-value content blob: actual byte
+ * length, segment count, and metadata trailer length. The metadata flag is
+ * implicit: `metadata_length > 0` iff a metadata trailer is present (the
+ * encoder never emits a flagged-but-zero-length trailer).
+ */
+struct LargeValueHeader
+{
+    uint32_t actual_length;
+    uint32_t num_segments;
+    uint16_t metadata_length;
+};
+
+/**
+ * @brief Parse the header of a large-value content blob. Decodes word0 to
+ * recover actual_length and the has-metadata flag, derives the segment count
+ * from actual_length and the configured segment size, and (when metadata is
+ * present) reads metadata_length from the trailer.
+ *
+ * The caller uses this to size the segment-ID buffer before calling
+ * DecodeLargeValueContent.
+ *
+ * @param encoded The encoded value content from the data page.
+ * @param segment_size The segment size in bytes from KvOptions.
+ * @return Parsed header, or std::nullopt on malformed input (truncated buffer
+ *   or trailing bytes don't match the expected size).
+ */
+inline std::optional<LargeValueHeader> DecodeLargeValueHeader(
+    std::string_view encoded, uint32_t segment_size)
+{
+    assert(segment_size > 0);
+    if (encoded.size() < sizeof(uint32_t))
+    {
+        return std::nullopt;
+    }
+    const uint32_t word0 = DecodeFixed32(encoded.data());
+    const bool has_metadata = (word0 & kLargeValueHasMetadataBit) != 0;
+
+    LargeValueHeader header{};
+    header.actual_length = word0 & kLargeValueLengthMask;
+    header.num_segments =
+        (header.actual_length + segment_size - 1) / segment_size;
+
+    const size_t segments_end =
+        sizeof(uint32_t) +
+        static_cast<size_t>(header.num_segments) * sizeof(PageId);
+
+    if (!has_metadata)
+    {
+        if (encoded.size() != segments_end)
+        {
+            return std::nullopt;
+        }
+        return header;
+    }
+
+    if (encoded.size() < segments_end + sizeof(uint16_t))
+    {
+        return std::nullopt;
+    }
+    header.metadata_length = DecodeFixed16(encoded.data() + segments_end);
+    const size_t expected =
+        segments_end + sizeof(uint16_t) + header.metadata_length;
+    if (encoded.size() != expected)
+    {
+        return std::nullopt;
+    }
+    return header;
+}
+
+/**
+ * @brief Decode the segment-ID array and/or the metadata blob from a
+ * large-value content blob. The caller must call DecodeLargeValueHeader
+ * first and pass the resulting @p header. Both output sinks are independently
+ * optional, so callers that need only one half (e.g. metadata-only readers,
+ * GC freeing segment IDs) don't have to allocate a buffer for the other.
+ *
+ * @param encoded The encoded value content from the data page.
+ * @param header Header parsed from a prior DecodeLargeValueHeader call.
+ * @param segment_ids Output span. Pass an empty span (default) to skip
+ *   segment-ID extraction. When non-empty, must be sized to
+ *   header.num_segments.
+ * @param[out] metadata_out Optional metadata sink. When non-null, receives
+ *   the metadata blob (cleared if no trailer is present). Pass nullptr to
+ *   skip metadata extraction.
+ * @return true on success; false if @p segment_ids is non-empty but its size
+ *   does not match header.num_segments.
+ */
+inline bool DecodeLargeValueContent(std::string_view encoded,
+                                    const LargeValueHeader &header,
+                                    std::span<PageId> segment_ids = {},
+                                    std::string *metadata_out = nullptr)
+{
+    const bool extract_segments = !segment_ids.empty();
+    if (extract_segments && segment_ids.size() != header.num_segments)
+    {
+        return false;
+    }
+
+    const char *seg_ptr = encoded.data() + sizeof(uint32_t);
+    if (extract_segments)
+    {
+        for (uint32_t i = 0; i < header.num_segments; ++i)
+        {
+            segment_ids[i] = DecodeFixed32(seg_ptr);
+            seg_ptr += sizeof(PageId);
+        }
+    }
+    else
+    {
+        // Skip past the segment-ID array to land on the metadata trailer.
+        seg_ptr += static_cast<size_t>(header.num_segments) * sizeof(PageId);
+    }
+
+    if (metadata_out != nullptr)
+    {
+        if (header.metadata_length > 0)
+        {
+            // Metadata bytes follow the uint16 metadata_length field.
+            metadata_out->assign(seg_ptr + sizeof(uint16_t),
+                                 header.metadata_length);
+        }
+        else
+        {
+            metadata_out->clear();
+        }
+    }
+    return true;
+}
 
 /**
  * Format:
@@ -39,10 +253,16 @@ public:
     DataPage(PageId page_id);
     DataPage(PageId page_id, Page page)
         : page_id_(page_id), page_(std::move(page)) {};
+    // Construct from a pinned MemCachedPage. Takes ownership of the pin: the
+    // returned DataPage Unpins on destruction. Callers obtain @p pinned via
+    // MemCachedPage::Handle::Release() after a successful
+    // PageManager::FindPage.
+    DataPage(PageId page_id, MemCachedPage *pinned);
     DataPage(const DataPage &) = delete;
     DataPage(DataPage &&rhs);
     DataPage &operator=(DataPage &&) noexcept;
     DataPage &operator=(const DataPage &) = delete;
+    ~DataPage();
 
     static uint16_t const page_size_offset = page_type_offset + sizeof(uint8_t);
     static uint16_t const prev_page_offset =
@@ -51,6 +271,10 @@ public:
     static uint16_t const content_offset = next_page_offset + sizeof(PageId);
 
     bool IsEmpty() const;
+    // Move out the owned Page buffer; only valid in owned-buffer mode (not
+    // in cache-handle-backed mode). Leaves the DataPage with an empty
+    // buffer.
+    Page ExtractPage();
     uint16_t ContentLength() const;
     uint16_t RestartNum() const;
     PageId PrevPageId() const;
@@ -62,14 +286,15 @@ public:
     char *PagePtr() const;
     void SetPage(Page page);
     void Clear();
-    bool IsRegistered() const
-    {
-        return page_.IsRegistered();
-    }
+    bool IsRegistered() const;
 
 private:
     PageId page_id_{MaxPageId};
     Page page_{false};
+    // When non-null, the buffer is backed by a pinned cached page (read-only;
+    // must not be mutated). page_ is empty in this mode. At most one of
+    // (page_ owns a buffer) or (cached_ != nullptr) is true.
+    MemCachedPage *cached_{nullptr};
 };
 
 std::ostream &operator<<(std::ostream &out, DataPage const &page);
@@ -85,6 +310,7 @@ public:
     std::string_view Key() const;
     std::string_view Value() const;
     bool IsOverflow() const;
+    bool IsLargeValue() const;
     compression::CompressionType CompressionType() const;
     uint64_t ExpireTs() const;
     uint64_t Timestamp() const;
@@ -126,6 +352,7 @@ private:
         uint32_t *value_length,
         bool *overflow,
         bool *expire,
+        bool *large_value,
         compression::CompressionType *compression_kind);
 
     const Comparator *const cmp_;
@@ -139,6 +366,7 @@ private:
     std::string key_;
     std::string_view value_;
     bool overflow_;
+    bool large_value_{false};
     compression::CompressionType compression_type_{
         compression::CompressionType::None};
     uint64_t timestamp_;

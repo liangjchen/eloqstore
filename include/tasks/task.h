@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/context/continuation.hpp>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -15,8 +16,9 @@ namespace eloqstore
 {
 class KvRequest;
 class KvTask;
-class IndexPageManager;
+class PageManager;
 class AsyncIoManager;
+class IoStringBuffer;
 struct KvOptions;
 class TaskManager;
 class PagesPool;
@@ -30,6 +32,16 @@ KvTask *ThdTask();
 AsyncIoManager *IoMgr();
 const KvOptions *Options();
 const Comparator *Comp();
+
+// Cooperative time-budgeted yield for any long-running task loop (compaction,
+// file GC, manifest replay, large scans, ...). Yields the running task to the
+// low-priority queue once it has held the worker thread past
+// eloqstore_yield_budget_us since its last resume, so no single uninterrupted
+// segment stalls foreground serving. The check reads the clock (one rdtsc +
+// divide); call it every iteration in loops whose body is a syscall / IO, but
+// in very cheap loop bodies poll it once every N iterations to amortize the
+// read.
+void MaybeYield();
 
 enum class TaskStatus : uint8_t
 {
@@ -55,9 +67,22 @@ enum struct TaskType
 
 std::pair<Page, KvError> LoadPage(const TableIdent &tbl_id,
                                   FilePageId file_page_id);
-std::pair<DataPage, KvError> LoadDataPage(const TableIdent &tbl_id,
-                                          PageId page_id,
-                                          FilePageId file_page_id);
+std::pair<DataPage, KvError> LoadDataPageStorage(const TableIdent &tbl_id,
+                                                 PageId page_id,
+                                                 FilePageId file_page_id);
+// Read a data page, going through the shared in-memory cache when
+// KvOptions::enable_data_page_cache is on. Falls back to LoadDataPageStorage()
+// otherwise. The returned DataPage is read-only when the cache hit path is
+// taken: callers that need to mutate the page buffer must use
+// LoadDataPageForUpdate() instead.
+std::pair<DataPage, KvError> LoadDataPage(MappingSnapshot *mapping,
+                                          PageId page_id);
+// Read a data page into a fresh, owned buffer that the caller may mutate.
+// Equivalent to LoadDataPageStorage() when the cache is off; on a cache hit,
+// copies the cached content out so the caller still owns a private buffer
+// without re-reading from storage.
+std::pair<DataPage, KvError> LoadDataPageForUpdate(MappingSnapshot *mapping,
+                                                   PageId page_id);
 std::pair<OverflowPage, KvError> LoadOverflowPage(const TableIdent &tbl_id,
                                                   PageId page_id,
                                                   FilePageId file_page_id);
@@ -67,17 +92,83 @@ std::pair<OverflowPage, KvError> LoadOverflowPage(const TableIdent &tbl_id,
  * @param tbl_id The table partition identifier.
  * @param mapping The mapping snapshot of this table partition.
  * @param encoded_ptrs The encoded overflow pointers.
+ * @param[out] value Output string to receive the assembled overflow value.
  */
-std::pair<std::string, KvError> GetOverflowValue(const TableIdent &tbl_id,
-                                                 const MappingSnapshot *mapping,
-                                                 std::string_view encoded_ptrs);
+KvError GetOverflowValue(const TableIdent &tbl_id,
+                         const MappingSnapshot *mapping,
+                         std::string_view encoded_ptrs,
+                         std::string &value);
 
-std::pair<std::string_view, KvError> ResolveValue(
-    const TableIdent &tbl_id,
-    MappingSnapshot *mapping,
-    DataPageIter &iter,
-    std::string &storage,
-    const compression::DictCompression *compression);
+class GlobalRegisteredMemory;
+
+/**
+ * @brief Read a large value stored in segment files into an IoStringBuffer.
+ *
+ * Segments are allocated from @p global_mem and appended to @p large_value
+ * one per K. The metadata trailer (if any) is parsed but not surfaced here -
+ * the caller should call DecodeLargeValueHeader / DecodeLargeValueContent
+ * separately if metadata is needed.
+ *
+ * @param tbl_id The table partition identifier.
+ * @param seg_mapping The segment mapping snapshot.
+ * @param encoded_content The encoded large value content from the data page.
+ * @param large_value Output IoStringBuffer to receive the segments.
+ * @param global_mem The global registered memory for segment allocation.
+ * @param reg_mem_index_base The io_uring buffer index base for global memory.
+ * @param yield Yield function for coroutine context when allocating segments.
+ */
+KvError GetLargeValue(const TableIdent &tbl_id,
+                      const MappingSnapshot *seg_mapping,
+                      std::string_view encoded_content,
+                      IoStringBuffer &large_value,
+                      GlobalRegisteredMemory *global_mem,
+                      uint16_t reg_mem_index_base,
+                      std::function<void()> yield);
+
+/**
+ * @brief Read a large value stored in segment files into contiguous pinned
+ * memory (KV Cache mode).
+ *
+ * @param tbl_id The table partition identifier.
+ * @param seg_mapping The segment mapping snapshot.
+ * @param encoded_content The encoded large value content from the data page.
+ * @param dst Pinned memory base where the value is written. Must lie within
+ *   a single chunk registered with this shard's io_uring; resolved to a
+ *   buffer index via IouringMgr::BufIndexForAddress once and reused for all
+ *   segments.
+ * @param dst_size Capacity at @p dst. Must satisfy
+ *   `(K - 1) * segment_size + 4096 <= dst_size <= K * segment_size`. The final
+ *   segment is read with `dst_size - (K - 1) * segment_size` bytes.
+ * @param io_mgr The IO manager that owns the io_uring and the buf-index
+ *   resolution for the pinned chunks.
+ */
+KvError GetLargeValueContiguous(const TableIdent &tbl_id,
+                                const MappingSnapshot *seg_mapping,
+                                std::string_view encoded_content,
+                                char *dst,
+                                size_t dst_size,
+                                AsyncIoManager *io_mgr);
+
+/**
+ * @brief Resolve the iterator's entry into @p value as either an inline value
+ * or the metadata trailer.
+ *
+ * - Non-large entry: writes the decoded inline / overflow / compressed bytes.
+ * - Large entry: writes the metadata blob (empty if the entry carries no
+ *   metadata trailer). The segment bytes are not touched -- the caller invokes
+ *   GetLargeValue or GetLargeValueContiguous separately when they need the
+ *   value's payload.
+ *
+ * Asserting `mapping` and `compression` are used directly here (for overflow
+ * resolution and compression respectively); no other plumbing is hidden in
+ * delegation.
+ */
+KvError ResolveValueOrMetadata(const TableIdent &tbl_id,
+                               MappingSnapshot *mapping,
+                               DataPageIter &iter,
+                               std::string &value,
+                               const compression::DictCompression *compression,
+                               bool extract_metadata = true);
 /**
  * @brief Decode overflow pointers.
  * @param encoded The encoded overflow pointers.
@@ -120,6 +211,7 @@ public:
     int io_res_{0};
     uint32_t io_flags_{0};
     bool needs_auto_reopen_{false};
+    bool needs_oom_retry_{false};
 
     TaskStatus status_{TaskStatus::Idle};
     KvRequest *req_{nullptr};

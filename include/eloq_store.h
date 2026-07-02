@@ -45,6 +45,7 @@ enum class RequestType : uint8_t
     BatchWrite,
     Reopen,
     Truncate,
+    Drop,
     DropTable,
     Archive,
     Compact,
@@ -78,6 +79,8 @@ inline const char *RequestTypeToString(RequestType type)
         return "reopen";
     case RequestType::Truncate:
         return "truncate";
+    case RequestType::Drop:
+        return "drop";
     case RequestType::DropTable:
         return "drop_table";
     case RequestType::Archive:
@@ -149,6 +152,7 @@ protected:
     uint64_t user_data_{0};
     std::function<void(KvRequest *)> callback_{nullptr};
     uint8_t reopen_retry_remaining_{0};
+    uint8_t oom_retry_remaining_{0};
 #ifdef ELOQ_MODULE_ENABLED
     mutable bthread::ConditionVariable cv_;
     mutable bthread::Mutex mutex_;
@@ -185,6 +189,30 @@ public:
     uint64_t ts_;
     uint64_t expire_ts_;
 
+    // Destination for the very-large-value bytes. The active alternative
+    // picks the read mode and the single container the value lands in:
+    //   std::monostate (default): metadata-only -- no segment reads. For
+    //     a non-large entry, `value_` receives the inline bytes; for a
+    //     large entry, `value_` receives the metadata blob (empty when
+    //     there is no metadata trailer).
+    //   IoStringBuffer: legacy zero-copy path. Dispatch allocates fragments
+    //     from the IoMgr's GlobalRegisteredMemory and appends them to this
+    //     buffer; the caller reads them back out of the variant after the
+    //     request completes.
+    //   std::pair<char *, size_t>: KV Cache pinned-memory path. The
+    //     contiguous range [ptr, ptr + size) is the destination.
+    // A value is loaded into at most one container per request -- the
+    // variant captures that constraint at the type level.
+    std::variant<std::monostate, IoStringBuffer, std::pair<char *, size_t>>
+        large_value_dest_;
+
+    // When true and the resolved entry is a large value, skip metadata
+    // extraction -- `value_` is left empty even when the entry carries a
+    // metadata trailer. Useful for the "I already retrieved the metadata,
+    // just give me the value bytes" pattern. Ignored when the destination
+    // is `std::monostate`.
+    bool large_value_only_{false};
+
 private:
     // input
     std::variant<std::string_view, std::string> key_;
@@ -213,6 +241,7 @@ public:
     // output
     std::string floor_key_;
     std::string value_;
+    IoStringBuffer large_value_;
     uint64_t ts_;
     uint64_t expire_ts_;
 
@@ -486,6 +515,16 @@ private:
     std::string position_storage_;
 };
 
+class DropRequest : public WriteRequest
+{
+public:
+    RequestType Type() const override
+    {
+        return RequestType::Drop;
+    }
+    void SetArgs(TableIdent tid);
+};
+
 class DropTableRequest : public KvRequest
 {
 public:
@@ -498,7 +537,7 @@ public:
 
 private:
     std::string table_name_;
-    std::vector<std::unique_ptr<TruncateRequest>> truncate_reqs_;
+    std::vector<std::unique_ptr<DropRequest>> drop_reqs_;
     std::atomic<uint32_t> pending_{0};
     std::atomic<uint8_t> first_error_{static_cast<uint8_t>(KvError::NoError)};
 
@@ -859,6 +898,13 @@ public:
         return store_mode_.load(std::memory_order_acquire);
     }
 
+    // Sum of data-page cache hits/misses across all shards. Bumped only when
+    // KvOptions::enable_data_page_cache is on. Index-page cache traffic is
+    // not counted here. ResetDataCacheCounters() zeroes all shards' counters.
+    size_t DataCacheHits() const;
+    size_t DataCacheMisses() const;
+    void ResetDataCacheCounters();
+
     uint64_t Term() const
     {
         return term_;
@@ -872,6 +918,25 @@ public:
                                           std::vector<uint64_t> weights);
     KvError UpdateStandbyMasterAddr(std::string standby_master_addr);
 
+    /**
+     * @brief Returns the io_uring buffer index base added to a
+     * GlobalRegisteredMemory chunk index when the shard registered its
+     * global registered memory. Callers integrating their own
+     * GlobalRegisteredMemory need this value to populate
+     * IoBufferRef::buf_index_ when building user-supplied IoStringBuffers
+     * for very-large-value writes, and to pass it to IoStringBuffer::Recycle
+     * after a read.
+     * @return 0 if the shard does not own a GlobalRegisteredMemory.
+     */
+    uint16_t GlobalRegMemIndexBase(size_t shard_id) const;
+
+    /**
+     * @brief Test-only: number of times the shard's tail-scratch pool has
+     * been acquired since startup. Returns 0 for non-pinned-mode managers
+     * or invalid shard IDs. See `IouringMgr::AcquireTailScratch`.
+     */
+    size_t TailScratchAcquireCount(size_t shard_id) const;
+
     bool ExecAsyn(KvRequest *req);
     void ExecSync(KvRequest *req);
 
@@ -881,6 +946,7 @@ public:
         req->user_data_ = data;
         req->callback_ = std::move(callback);
         req->reopen_retry_remaining_ = options_.auto_reopen_retry_times;
+        req->oom_retry_remaining_ = options_.auto_oom_retry_times;
         return SendRequest(req);
     }
 

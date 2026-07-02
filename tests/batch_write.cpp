@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cstdlib>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -127,8 +128,9 @@ TEST_CASE("batch write abort releases pinned index pages",
     opts.store_path = {test_path};
     opts.num_threads = 1;
     opts.data_page_size = 4096;
-    opts.buffer_pool_size = 4096;  // Allow only a single MemIndexPage.
+    opts.buffer_pool_size = 4096;  // Allow only a single MemCachedPage.
     opts.max_write_batch_pages = 4;
+    opts.auto_oom_retry_times = 0;
 
     auto build_entries =
         [](uint32_t start, uint32_t count, size_t key_len, size_t value_len)
@@ -273,7 +275,13 @@ TEST_CASE("batch write task pool handles many partitions concurrently",
     }
 
     // Final truncate across all partitions to make sure TaskPool objects and
-    // mapping snapshots can be recycled repeatedly.
+    // mapping snapshots can be recycled repeatedly. Partitions whose wave2
+    // write exhausted its OOM retries were never recreated after trunc1
+    // cleaned them up, so Truncate on those surfaces NotFound rather than
+    // NoError. Both outcomes are valid recycle paths -- the test only fails
+    // on a different error class. (This case is rare in the regular build
+    // but more frequent under ASan, where the slower scheduling causes more
+    // wave2 batches to exhaust their retry budget.)
     std::vector<eloqstore::TruncateRequest> trunc2(partitions);
     for (uint32_t pid = 0; pid < partitions; ++pid)
     {
@@ -281,10 +289,22 @@ TEST_CASE("batch write task pool handles many partitions concurrently",
         trunc2[pid].SetTableId(tbl_id);
         REQUIRE(store->ExecAsyn(&trunc2[pid]));
     }
+    std::unordered_set<uint32_t> succeeded_set(succeeded.begin(),
+                                               succeeded.end());
     for (uint32_t pid = 0; pid < partitions; ++pid)
     {
         trunc2[pid].Wait();
-        REQUIRE(trunc2[pid].Error() == eloqstore::KvError::NoError);
+        eloqstore::KvError err = trunc2[pid].Error();
+        if (succeeded_set.count(pid) != 0)
+        {
+            // Wave2 wrote data into this partition, so Truncate must clear it.
+            REQUIRE(err == eloqstore::KvError::NoError);
+        }
+        else
+        {
+            REQUIRE((err == eloqstore::KvError::NoError ||
+                     err == eloqstore::KvError::NotFound));
+        }
     }
 }
 
@@ -313,6 +333,7 @@ TEST_CASE("batch write task pool cleaned after abort", "[batch_write]")
     eloqstore::KvOptions opts = append_opts;
     opts.num_threads = 1;  // route all partitions to the same shard
     opts.buffer_pool_size = opts.data_page_size;  // only one index page buffer
+    opts.auto_oom_retry_times = 0;
 
     eloqstore::EloqStore *store = InitStore(opts);
     const std::vector<eloqstore::TableIdent> partitions = {

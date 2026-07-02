@@ -8,13 +8,17 @@
 
 #include "error.h"
 #include "storage/data_page.h"
-#include "storage/mem_index_page.h"
+#include "storage/mem_cached_page.h"
 #include "storage/root_meta.h"
 #include "tasks/task.h"
 #include "types.h"
 
 namespace eloqstore
 {
+// Scan does not support very-large values (those stored in segment files via
+// IoStringBuffer). Encountering such a row produces
+// KvError::LargeValueUnsupported; callers must fetch those keys through
+// ReadTask instead. See docs/zero_copy_read.md.
 class ScanIterator
 {
 public:
@@ -27,7 +31,7 @@ public:
     KvError Next();
 
     std::string_view Key() const;
-    std::pair<std::string_view, KvError> ResolveValue(std::string &storage);
+    KvError ResolveValue(std::string &value);
     uint64_t ExpireTs() const;
     uint64_t Timestamp() const;
 
@@ -36,13 +40,13 @@ public:
 private:
     struct IndexFrame
     {
-        IndexFrame(MemIndexPage::Handle handle_in, IndexPageIter iter_in)
+        IndexFrame(MemCachedPage::Handle handle_in, IndexPageIter iter_in)
             : iter(std::move(iter_in)), handle(std::move(handle_in))
         {
         }
 
         IndexPageIter iter;
-        MemIndexPage::Handle handle;
+        MemCachedPage::Handle handle;
     };
 
     const TableIdent tbl_id_;

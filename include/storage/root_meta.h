@@ -15,7 +15,7 @@
 #include "compression.h"
 #include "kv_options.h"
 #include "manifest_buffer.h"
-#include "storage/mem_index_page.h"
+#include "storage/mem_cached_page.h"
 #include "storage/page_mapper.h"
 #include "tasks/task.h"
 
@@ -30,15 +30,20 @@ namespace eloqstore
 //               BranchFileMapping:
 //                 num_entries(8B) |
 //                 per entry: name_len(4B) | name(bytes) | term(8B) |
-//                 max_file_id(8B) ]
+//                 max_file_id(8B) | max_segment_file_id(8B) |
+//             max_segment_fp_id(varint64) |
+//             segment_mapping_bytes_len(4B) |
+//             segment_mapping_tbl(varint64...) ]
 //
 // For appended Manifest log, the structure is:
 // Header  :  [ Checksum(8B) | Root(4B) | TTL Root(4B) | Payload Len(4B) ]
 // LogBody :  [ mapping_bytes_len(4B) | mapping_bytes(varint64...) |
-//              BranchManifestMetadata (same layout as above) ]
+//              BranchManifestMetadata (same layout as above) |
+//              segment_delta_bytes_len(4B) |
+//              segment_deltas(varint32+varint64 pairs...) ]
 class PageMapper;
 struct MappingSnapshot;
-class IndexPageManager;
+class PageManager;
 
 class ManifestBuilder
 {
@@ -51,12 +56,15 @@ public:
      *        BranchManifestMetadata to buff_.
      */
     void AppendBranchManifestMetadata(std::string_view branch_metadata);
+    void AppendSegmentMapping(std::string_view segment_mapping);
     std::string_view Snapshot(PageId root_id,
                               PageId ttl_root,
                               const MappingSnapshot *mapping,
                               FilePageId max_fp_id,
                               std::string_view dict_bytes,
-                              const BranchManifestMetadata &branch_metadata);
+                              const BranchManifestMetadata &branch_metadata,
+                              const MappingSnapshot *segment_mapping = nullptr,
+                              FilePageId max_segment_fp_id = 0);
 
     std::string_view Finalize(PageId new_root, PageId ttl_root);
     static bool ValidateChecksum(std::string_view record);
@@ -87,11 +95,24 @@ struct RootMeta
     PageId root_id_{MaxPageId};
     PageId ttl_root_id_{MaxPageId};
     std::unique_ptr<PageMapper> mapper_{nullptr};
+    std::unique_ptr<PageMapper> segment_mapper_{nullptr};
     absl::flat_hash_set<MappingSnapshot *> mapping_snapshots_;
-    absl::flat_hash_set<MemIndexPage *> index_pages_;
+    absl::flat_hash_set<MappingSnapshot *> segment_mapping_snapshots_;
+    absl::flat_hash_set<MemCachedPage *> cached_pages_;
     uint64_t manifest_size_{0};
     uint64_t next_expire_ts_{0};
     std::shared_ptr<compression::DictCompression> compression_{nullptr};
+
+    // Snapshot of the data / segment FilePageAllocator's MaxFilePageId() the
+    // last time a manifest for this table was successfully written. Same
+    // "smallest unallocated/unflushed" semantics as
+    // FilePageAllocator::max_fp_id_. Consumed by file GC to derive the
+    // per-branch in-flight boundary (BranchGuard::least_unflushed_file_id_);
+    // files at file_id < (first_unflushed_fp_id_ >> pages_per_file_shift) are
+    // fully captured by some disk manifest and become deletion candidates if
+    // unreferenced.
+    FilePageId first_unflushed_fp_id_{0};
+    FilePageId first_unflushed_seg_fp_id_{0};
 
     uint32_t ref_cnt_{0};
     bool locked_{false};
@@ -163,10 +184,14 @@ public:
         Entry *entry_{nullptr};
     };
 
-    RootMetaMgr(IndexPageManager *owner, const KvOptions *options);
+    RootMetaMgr(PageManager *owner, const KvOptions *options);
 
     std::pair<Entry *, bool> GetOrCreate(const TableIdent &tbl_id);
     Entry *Find(const TableIdent &tbl_id);
+    // Plain lookup that does NOT run ProcessPendingErase(). Used by
+    // PageManager::RecyclePage(), which must not trigger deferred table erase
+    // (it can run inside Erase() and would re-enter the erase logic).
+    Entry *FindNoErase(const TableIdent &tbl_id);
     void Erase(const TableIdent &tbl_id);
 
     void Pin(Entry *entry);
@@ -189,9 +214,10 @@ public:
     KvError EvictIfNeeded();
 
 private:
-    IndexPageManager *owner_;
+    PageManager *owner_;
     void EnqueueFront(Entry *entry);
     void Dequeue(Entry *entry);
+    void ProcessPendingErase();
 
     const KvOptions *options_;
     size_t capacity_bytes_{0};
@@ -199,6 +225,11 @@ private:
     std::unordered_map<TableIdent, Entry> entries_;
     Entry lru_head_{};
     Entry lru_tail_{};
+    // Entries that became empty (root_id==MaxPageId, mapper==null) while a
+    // reader held a Handle.  They are actually erased on the next Find or
+    // GetOrCreate call — the only safe time since no Handle can be live
+    // across those calls.
+    std::vector<TableIdent> pending_erase_;
 };
 
 struct CowRootMeta
@@ -211,10 +242,16 @@ struct CowRootMeta
     PageId root_id_{MaxPageId};
     PageId ttl_root_id_{MaxPageId};
     std::unique_ptr<PageMapper> mapper_{nullptr};
+    std::unique_ptr<PageMapper> segment_mapper_{nullptr};
     uint64_t manifest_size_{};
     MappingSnapshot::Ref old_mapping_{nullptr};
+    MappingSnapshot::Ref old_segment_mapping_{nullptr};
     uint64_t next_expire_ts_{};
     std::shared_ptr<compression::DictCompression> compression_{nullptr};
+    // Mirrors RootMeta::first_unflushed_*_fp_id_; written by WriteTask after
+    // a successful FlushManifest and propagated by PageManager::UpdateRoot.
+    FilePageId first_unflushed_fp_id_{0};
+    FilePageId first_unflushed_seg_fp_id_{0};
     RootMetaMgr::Handle root_handle_{};
 };
 

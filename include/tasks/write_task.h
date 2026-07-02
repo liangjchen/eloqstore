@@ -9,8 +9,8 @@
 #include "direct_io_buffer.h"
 #include "error.h"
 #include "storage/data_page.h"
-#include "storage/index_page_manager.h"
 #include "storage/object_store.h"
+#include "storage/page_manager.h"
 #include "storage/page_mapper.h"
 #include "storage/root_meta.h"
 #include "tasks/task.h"
@@ -90,21 +90,58 @@ public:
 
 protected:
     KvError FlushManifest();
-    KvError UpdateMeta();
+    /**
+     * @brief Flush the current `cow_meta_` to manifest and publish it as the
+     * new root. If @p trigger_compact is true (the default, used by
+     * BatchWrite paths), also evaluate both mappers against their
+     * amplification factors and set the shard pending-compact signal when
+     * warranted. Background compaction itself must pass `false` to avoid
+     * re-signaling compaction on the state it just produced.
+     */
+    KvError UpdateMeta(bool trigger_compact = true);
 
     /**
      * @brief Request shard to create a compaction task if space amplification
      * factor is too big.
      */
-    void CompactIfNeeded(PageMapper *mapper) const;
+    void CompactIfNeeded(PageMapper *mapper, uint32_t amplify_factor) const;
+
+    /**
+     * @brief Pure predicate: returns true iff @p mapper warrants compaction at
+     * @p amp_factor (empty mapping with non-empty space, or live-ratio above
+     * the threshold). Assumes the mapper's allocator is an AppendAllocator;
+     * callers are responsible for gating (e.g. opts->data_append_mode for the
+     * data mapper).
+     */
+    static bool MapperExceedsAmplification(const PageMapper *mapper,
+                                           uint32_t amp_factor);
     void TriggerTTL();
     void TriggerFileGC() const;
     KvError TriggerLocalFileGC() const;
 
+    // Cache-first read-only load (type 2): use when inspecting a data page
+    // without modifying it.
     std::pair<DataPage, KvError> LoadDataPage(PageId page_id);
+    // Load into a fresh, owned buffer that this task may mutate (type 1).
+    // Goes through the cache to elide the storage read on a hit, then copies
+    // out so the caller's buffer is private.
+    std::pair<DataPage, KvError> LoadDataPageForUpdate(PageId page_id);
     std::pair<OverflowPage, KvError> LoadOverflowPage(PageId page_id);
 
     std::pair<PageId, FilePageId> AllocatePage(PageId page_id);
+
+    /**
+     * @brief Allocate a segment on cow_meta_.segment_mapper_.
+     *
+     * If @p page_id is MaxPageId, a fresh logical segment id is obtained via
+     * PageMapper::GetPage(); otherwise the supplied logical id is remapped.
+     * Stamps the term for the file that receives the new physical segment
+     * (and for any file the allocator crossed into), updates the segment
+     * mapping, and records the mapping delta for the manifest.
+     *
+     * Precondition: cow_meta_.segment_mapper_ is non-null.
+     */
+    std::pair<PageId, FilePageId> AllocateSegment(PageId page_id);
     std::string_view TaskTypeName() const;
     void FreePage(PageId page_id);
 
@@ -117,18 +154,61 @@ protected:
 
     KvError WritePage(DataPage &&page);
     KvError WritePage(OverflowPage &&page);
-    KvError WritePage(MemIndexPage::Handle &page);
-    KvError WritePage(MemIndexPage::Handle &page, FilePageId file_page_id);
+    KvError WritePage(MemCachedPage::Handle &page);
+    KvError WritePage(MemCachedPage::Handle &page, FilePageId file_page_id);
     KvError WritePage(VarPage page, FilePageId file_page_id);
     KvError AppendWritePage(VarPage page, FilePageId file_page_id);
     void FlushAppendWrites();
+    // Build this task's CoW root and snapshot the branch-file-mapping tail in
+    // one step: forwards to PageManager::MakeCowRoot, and on success captures
+    // the tail (before any allocation can advance it) so Abort() can roll the
+    // BranchFileMapping high-water marks back. On failure returns the
+    // PageManager error without capturing. Call this instead of
+    // shard->IndexManager()->MakeCowRoot() from write paths.
+    KvError MakeCowRoot();
+    // Capture pre_branch_tail_ once, from MakeCowRoot() at task start. Asserts
+    // it has not already been captured this task (Reset() clears it).
+    void SnapshotBranchTail();
     KvError WaitPendingUploads();
     KvError ConsumePendingUploadResults();
     std::pair<FileId, uint32_t> ConvFilePageId(FilePageId file_page_id) const;
     virtual DirectIoBuffer AcquireUploadStateBuffer();
     virtual void ReleaseUploadStateBuffer(DirectIoBuffer buffer);
 
+    // Segment mapping deltas accumulated during this write task.
+    // Format: varint32(page_id) + varint64(encoded_file_page_id) pairs.
+    // Serialized with a Fixed32 length prefix in FlushManifest.
+    std::string seg_mapping_deltas_;
+    void RecordSegmentMappingUpdate(PageId page_id, FilePageId file_page_id);
+    void RecordSegmentMappingDelete(PageId page_id);
+
     std::optional<FileId> last_append_file_id_;
+    // Mirror of last_append_file_id_ for the segment side: caches the
+    // most-recently-stamped segment file id so AllocateSegment can skip
+    // the branch/term GetBranchNameAndTerm lookup when consecutive
+    // segments land in the same file (the common case in batched writes
+    // and compaction rewrites).
+    std::optional<FileId> last_seen_segment_file_id_;
+
+    // Pre-task snapshot of this table's BranchFileMapping tail, captured before
+    // the first file-id stamp. AllocatePage/AllocateSegment advance the tail's
+    // max_file_id_/max_segment_file_id_ via SetBranchFileIdTerm (or append one
+    // new (branch, term) entry). Abort() discards the CoW allocator but those
+    // high-water marks live in IoMgr and would otherwise survive, leaving the
+    // next write to allocate a lower file id than the recorded max and trip the
+    // ascending-order CHECK. A task only ever touches the tail, so remembering
+    // the pre-task size and the tail's two maxima is enough to undo it -- no
+    // need to copy the whole mapping. size_ == kNotCaptured means not captured
+    // yet.
+    struct BranchTailSnapshot
+    {
+        static constexpr size_t kNotCaptured = ~size_t{0};
+        size_t size_{kNotCaptured};
+        FileId max_file_id_{0};
+        FileId max_segment_file_id_{0};
+    };
+    BranchTailSnapshot pre_branch_tail_;
+
     WriteBufferAggregator append_aggregator_{0};
     UploadState upload_state_;
     uint32_t inflight_upload_tasks_{0};
