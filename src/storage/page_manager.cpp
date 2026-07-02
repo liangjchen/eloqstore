@@ -471,8 +471,10 @@ KvError PageManager::InstallEmptySnapshot(const TableIdent &tbl_ident,
 
 KvError PageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
                                              CowRootMeta &cow_meta,
-                                             std::string_view reopen_tag)
+                                             std::string_view reopen_tag,
+                                             bool &cleared_local_state)
 {
+    cleared_local_state = false;
     CHECK(eloq_store != nullptr);
     const StoreMode mode = eloq_store->Mode();
     if (mode != StoreMode::Cloud && mode != StoreMode::StandbyReplica)
@@ -573,6 +575,7 @@ KvError PageManager::InstallExternalSnapshot(const TableIdent &tbl_ident,
             cow_meta.root_id_ = MaxPageId;
             cow_meta.ttl_root_id_ = MaxPageId;
             cow_meta.manifest_size_ = 0;
+            cleared_local_state = true;
             return KvError::NoError;
         }
         LOG(ERROR) << "InstallExternalSnapshot RefreshManifest failed, table "
@@ -747,7 +750,7 @@ void PageManager::FreeMappingSnapshot(MappingSnapshot *mapping)
         // segment mapping collection.
         n = meta.segment_mapping_snapshots_.erase(mapping);
     }
-    CHECK(n == 1);
+    CHECK(n == 1 || n == 0);
 }
 
 void PageManager::TryRecycleCachedPage(MemCachedPage *page)
