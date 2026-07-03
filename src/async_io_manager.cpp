@@ -4460,6 +4460,10 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::GetManifest(
     do
     {
         ObjectStore::ListTask list_task(remote_path, false);
+        // Manifest keys are flat under the prefix; list without a delimiter
+        // so the response cannot carry directory-style CommonPrefixes
+        // entries (see the parse-failure skip below).
+        list_task.SetRecursive(true);
         list_task.SetContinuationToken(continuation_token);
         list_task.SetKvTask(current_task);
         AcquireCloudSlot(current_task);
@@ -4515,9 +4519,17 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::GetManifest(
         std::optional<std::string> tag;
         if (!ParseManifestFileSuffix(name, branch_name, term, tag))
         {
-            LOG(FATAL) << "CloudStoreMgr::GetManifest: failed to parse "
-                          "manifest file suffix: "
-                       << name;
+            // Not a valid manifest file name. The delimiter list may return
+            // a directory-style CommonPrefixes entry (ending with '/') when
+            // the manifest object is concurrently dropped: S3-compatible
+            // stores such as MinIO keep each object as a directory on disk,
+            // and a racing list can observe it without its metadata. The
+            // entry is transient; skip it. Each partition has a single
+            // owner, so a missing flat manifest means the manifest is being
+            // dropped and the partition is treated as absent.
+            LOG(WARNING) << "CloudStoreMgr::GetManifest: skip unrecognized "
+                            "entry under manifest prefix of table "
+                         << tbl_id << ": " << name;
             continue;
         }
 
@@ -4712,6 +4724,9 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::RefreshManifest(
             do
             {
                 ObjectStore::ListTask list_task(remote_path, false);
+                // Flat manifest keys; no delimiter so the response cannot
+                // carry CommonPrefixes entries (see GetManifest).
+                list_task.SetRecursive(true);
                 list_task.SetContinuationToken(continuation_token);
                 list_task.SetKvTask(current_task);
                 AcquireCloudSlot(current_task);
@@ -4761,9 +4776,12 @@ std::pair<ManifestFilePtr, KvError> CloudStoreMgr::RefreshManifest(
                 std::optional<std::string> tag;
                 if (!ParseManifestFileSuffix(name, branch_name, term, tag))
                 {
-                    LOG(FATAL) << "CloudStoreMgr::RefreshManifest: failed to "
-                                  "parse manifest file suffix: "
-                               << name;
+                    // Transient directory-style entry from a racing drop;
+                    // see CloudStoreMgr::GetManifest for details.
+                    LOG(WARNING)
+                        << "CloudStoreMgr::RefreshManifest: skip unrecognized "
+                           "entry under manifest prefix of table "
+                        << tbl_id << ": " << name;
                     continue;
                 }
                 if (tag.has_value())
