@@ -101,6 +101,12 @@ private:
     void OnReceivedReq(KvRequest *req);
     bool ProcessReq(KvRequest *req);
     void EnqueueForAutoReopen(KvRequest *req);
+    void EnqueueDelayedReopenRequest(ReopenRequest *req);
+    void PromoteReadyDelayedReopenRequests();
+    bool HasPendingDelayedRequests() const
+    {
+        return !delayed_requests_.empty();
+    }
     void TryStartPendingWrite(const TableIdent &tbl_id);
     void TryDispatchPendingWrites();
 
@@ -112,7 +118,7 @@ private:
         // io.
         return req_queue_size_.load(std::memory_order_relaxed) == 0 &&
                task_mgr_.NumActive() == 0 && io_mgr_->IsIdle() &&
-               !io_mgr_->NeedPrewarm();
+               !io_mgr_->NeedPrewarm() && delayed_requests_.empty();
     }
     void BindExtThd()
     {
@@ -314,11 +320,22 @@ private:
 
     struct PendingReopenState
     {
-        bool inflight{false};
-        std::vector<KvRequest *> waiters;
-        std::unique_ptr<ReopenRequest> request;
+        std::vector<KvRequest *> waiters_;
+        ReopenRequest request_;
     };
     std::unordered_map<TableIdent, PendingReopenState> pending_reopens_;
+
+    struct DelayedEntry
+    {
+        ReopenRequest *request;
+        uint64_t execute_at_us;
+
+        bool operator>(const DelayedEntry &other) const
+        {
+            return execute_at_us > other.execute_at_us;
+        }
+    };
+    std::vector<DelayedEntry> delayed_requests_;
 
 #ifdef ELOQ_MODULE_ENABLED
     std::atomic<size_t> req_queue_size_{0};

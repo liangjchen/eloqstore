@@ -22,6 +22,7 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
     }
     StandbyService *standby_service = nullptr;
     std::string tag;
+    KvError sync_err = KvError::NoError;
     if (mode == StoreMode::StandbyReplica)
     {
         standby_service = shard->store_->GetStandbyService();
@@ -46,7 +47,7 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
                 return enqueue_err;
             }
             current_task->WaitIo();
-            KvError sync_err = static_cast<KvError>(current_task->io_res_);
+            sync_err = static_cast<KvError>(current_task->io_res_);
             if (sync_err != KvError::NoError && sync_err != KvError::NotFound &&
                 sync_err != KvError::ResourceMissing)
             {
@@ -59,9 +60,12 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
     }
 
     KvError err = KvError::NoError;
-    if (request->Clean())
+    bool clear_local_state = request->Clean() ||
+                             sync_err == KvError::NotFound ||
+                             sync_err == KvError::ResourceMissing;
+    if (clear_local_state)
     {
-        // Remote partition no longer exists — delete local manifest and
+        // Remote partition no longer exists: delete local manifest and
         // clear in-memory state instead of writing an empty snapshot.
         err = shard->IoManager()->DropManifest(tbl_id);
         if (err != KvError::NoError)
@@ -91,8 +95,13 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
     }
     else
     {
+        bool install_cleared_local_state = false;
         err = shard->IndexManager()->InstallExternalSnapshot(
-            tbl_id, cow_meta_, request->Tag());
+            tbl_id, cow_meta_, request->Tag(), install_cleared_local_state);
+        if (err == KvError::NoError && install_cleared_local_state)
+        {
+            clear_local_state = true;
+        }
     }
     if (err != KvError::NoError)
     {
@@ -110,7 +119,7 @@ KvError ReopenTask::Reopen(const TableIdent &tbl_id)
         prewarm_service->Prewarm(tbl_id);
     }
 
-    if (!shard->HasPendingLocalGc(tbl_id))
+    if (clear_local_state && !shard->HasPendingLocalGc(tbl_id))
     {
         shard->AddPendingLocalGc(tbl_id);
     }

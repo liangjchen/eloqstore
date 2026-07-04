@@ -145,6 +145,17 @@ public:
     bool IsDone() const;
     void Wait() const;
 
+    void SetReopen(bool v)
+    {
+        reopen_ = v;
+    }
+    bool Reopen() const
+    {
+        return reopen_;
+    }
+
+    bool reopen_{false};
+
 protected:
     void SetDone(KvError err);
 
@@ -460,8 +471,8 @@ public:
     {
         return tag_;
     }
-    // `clean=true` means reopen should accept a missing remote snapshot and
-    // replace any existing local partition state with an empty snapshot.
+    // `clean=true` means reopen should clear local partition state
+    // instead of fetching/installing a remote snapshot.
     void SetClean(bool clean)
     {
         clean_ = clean;
@@ -470,10 +481,20 @@ public:
     {
         return clean_;
     }
+    void SetPendingTime(uint64_t us)
+    {
+        pending_time_us_ = us;
+    }
+    uint64_t PendingTime() const
+    {
+        return pending_time_us_;
+    }
 
 private:
+    // Archive tag to reopen; empty means reopen the latest available snapshot.
     std::string tag_;
     bool clean_{false};
+    uint64_t pending_time_us_{0};
 
     friend class EloqStore;
     friend class ReopenTask;
@@ -679,6 +700,7 @@ public:
     }
 
 private:
+    // Archive tag to reopen across all tables; empty means latest snapshot.
     std::string tag_;
     std::vector<std::unique_ptr<ReopenRequest>> reopen_reqs_;
     std::atomic<uint32_t> pending_{0};
