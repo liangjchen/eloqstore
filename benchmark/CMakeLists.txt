@@ -18,11 +18,14 @@ if (WITH_ROCKSDB)
     add_compile_definitions(WITH_ROCKSDB)
 endif()
 
-find_path(BRPC_INCLUDE_PATH NAMES brpc/server.h)
-find_library(BRPC_LIB NAMES brpc)
-if ((NOT BRPC_INCLUDE_PATH) OR (NOT BRPC_LIB))
-    message(FATAL_ERROR "Fail to find brpc")
-endif ()
+# brpc is built in-tree by the top-level CMakeLists (pinned in
+# cmake/dependencies.cmake). Linking the static archive needs its private
+# dependencies (brpc's pkg-config list) at the final link.
+find_library(PROTOBUF_LIB protobuf REQUIRED)
+find_library(PROTOC_LIB protoc REQUIRED)
+find_library(LEVELDB_LIB leveldb REQUIRED)
+set(BRPC_LIB brpc-static OpenSSL::SSL OpenSSL::Crypto
+    ${PROTOBUF_LIB} ${PROTOC_LIB} ${LEVELDB_LIB} z dl)
 include_directories(${BRPC_INCLUDE_PATH})
 set(DYNAMIC_LIB ${DYNAMIC_LIB} ${BRPC_LIB})
 
