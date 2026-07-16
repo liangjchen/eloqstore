@@ -23,7 +23,7 @@ cmake --build build -j$(nproc)
 
 Useful CMake options: `WITH_ASAN=ON` (needs `libboost_context-asan`), `WITH_COVERAGE=ON`, `ELOQ_MODULE_ENABLED=ON` (embedding/module mode), `WITH_UNIT_TESTS`/`WITH_EXAMPLE`/`WITH_DB_STRESS`/`WITH_BENCHMARK` (all default ON). Compile commands are exported to `build/` and `.clangd` points there.
 
-CMake configure runs `git submodule update --init --recursive` automatically (submodules live in `external/`).
+CMake configure runs `git submodule update --init --recursive` automatically (submodules live in `external/`). Version-pinned dependencies (aws-sdk-cpp core, glog, brpc, liburing, Catch2) are downloaded and built in-tree via FetchContent, pinned in `cmake/dependencies.cmake` — the first configure needs network access and takes a while. Set the `FETCHCONTENT_BASE_DIR` env var (CI uses `/home/runner/.cache/eloq-fetchcontent`, cached per-arch keyed on the pin file's hash) to share the pool across build trees and survive `rm -rf build`.
 
 ## Tests
 
@@ -77,4 +77,4 @@ Full subsystem documentation lives in `docs/architecture/` (see above). The load
 
 ## CI notes
 
-PRs need the `ci-approved` label for CI to run (`.github/workflows/ci.yml`). CI builds Debug with `SKIP_CREATE_BUCKET=ON`, runs C++ tests against MinIO, then builds/tests the Python wheel and Rust SDK.
+CI (`.github/workflows/ci.yml`) builds Debug with `SKIP_CREATE_BUCKET=ON`, runs C++ tests against MinIO, then builds/tests the Python wheel and Rust SDK.
